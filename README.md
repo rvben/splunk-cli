@@ -233,9 +233,12 @@ cargo +1.90.0 check --locked --all-targets
 make conformance         # requires the clispec v0.3 scorer
 ```
 
-Tests use local HTTP servers and require no Splunk account. Real-instance
-verification is a separate step; no live Splunk service was used during initial
-development. Endpoint behavior follows Splunk's
+The default tests use local HTTP servers and require no Splunk account. Run
+`SPLUNK_ACCEPT_LICENSE=yes make test-live` for opt-in checks against a disposable
+Splunk server on a native x86 Docker daemon, including saved terminal login,
+token expiry, profile isolation, searches, jobs, saved searches, and indexes.
+Docker contexts and `DOCKER_HOST` support homelab execution; see the
+[live test instructions](tests/live/README.md). Endpoint behavior follows Splunk's
 [search API reference](https://help.splunk.com/en/splunk-enterprise/rest-api-reference/10.2/search-endpoints/search-endpoint-descriptions)
 and [authentication documentation](https://help.splunk.com/en/splunk-enterprise/administer/manage-users-and-security/10.2/authenticate-into-the-splunk-platform-with-tokens/use-authentication-tokens).
 
