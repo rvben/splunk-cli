@@ -23,7 +23,7 @@ external contributors. The repository owner can integrate directly on main.
    Build a local wheel/sdist, run `twine check --strict`, and install the wheel
    into a clean environment to exercise `--version` and `schema`.
 4. For a new version, run `vership bump patch --prepare` (or minor/major).
-   Prepare initial 0.1.0 with `vership release --prepare`. Review the version,
+   Prepare initial 0.0.1 with `vership release --prepare`. Review the version,
    changelog, and exact release commit. Do not bump again after preparation.
 5. Once the user approves pushing and publishing that release, run
    `vership release`. The tag starts the PyPI workflow. A workflow dispatch
