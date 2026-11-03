@@ -719,3 +719,1022 @@ fn relative_xdg_config_home_is_ignored() {
         .unwrap();
     assert!(std::path::Path::new(data(&out)["path"].as_str().unwrap()).is_absolute());
 }
+
+#[tokio::test]
+async fn splunk_warnings_survive_projection_and_quiet_without_leaking_credentials() {
+    let server = MockServer::start().await;
+    Mock::given(method("GET"))
+        .and(path("/services/server/info"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+            "entry": [{"name": "server", "content": {"version": "10"}}],
+            "messages": [{"type": "WARN", "text": "partial test-secret\u{001b}[31m results"}]
+        })))
+        .mount(&server)
+        .await;
+    let out = run(&server, &["server", "info", "--quiet"]).await;
+    assert_eq!(data(&out)["version"], "10");
+    let stderr = String::from_utf8(out.stderr).unwrap();
+    assert!(stderr.contains("Warning: partial [REDACTED]"), "{stderr}");
+    assert!(!stderr.contains("test-secret"));
+    assert!(!stderr.contains('\u{001b}'));
+}
+
+#[test]
+fn a_closed_pipeline_exits_quietly() {
+    let (reader, writer) = std::io::pipe().unwrap();
+    drop(reader);
+    let out = command(&["schema"]).stdout(writer).output().unwrap();
+    assert!(
+        out.status.success(),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    assert!(out.stderr.is_empty());
+}
+
+#[test]
+fn profile_selection_persists_and_explicit_overrides_win() {
+    let dir = tempfile::tempdir().unwrap();
+    let config = dir.path().join("config.toml");
+    std::fs::write(&config, "[profiles.default]\nurl='https://default.example:8089'\n[profiles.prod]\nurl='https://prod.example:8089'\n").unwrap();
+    let invoke = |args: &[&str]| {
+        command(args)
+            .env("SPLUNK_CONFIG", &config)
+            .output()
+            .unwrap()
+    };
+    assert_eq!(
+        data(&invoke(&["profile", "use", "prod"]))["active_profile"],
+        "prod"
+    );
+    assert_eq!(data(&invoke(&["config", "show"]))["profile"], "prod");
+    assert_eq!(
+        data(&invoke(&["config", "show", "--profile", "default"]))["profile"],
+        "default"
+    );
+    let listed = data(&invoke(&["profile", "list"]));
+    assert_eq!(listed["items"][1]["name"], "prod");
+    assert_eq!(listed["items"][1]["active"], true);
+    error(&invoke(&["profile", "use", "absent"]), 4, "not_found");
+    error(
+        &invoke(&["profile", "remove", "prod"]),
+        8,
+        "confirmation_required",
+    );
+    assert_eq!(
+        data(&invoke(&["profile", "remove", "prod", "--dry-run"]))["dry_run"],
+        true
+    );
+    assert_eq!(data(&invoke(&["config", "show"]))["profile"], "prod");
+}
+
+#[test]
+fn offline_diagnostics_report_sources_without_claiming_authenticated_or_using_network() {
+    let out = command(&["doctor", "--offline"])
+        .env("SPLUNK_URL", "https://unreachable.invalid:8089")
+        .env("SPLUNK_TOKEN", "private-token")
+        .output()
+        .unwrap();
+    let report = data(&out);
+    assert_eq!(report["ok"], true);
+    assert_eq!(report["offline"], true);
+    assert_eq!(report["credentials"]["source"], "environment");
+    assert_eq!(report["credentials"]["verified"], false);
+    assert!(!String::from_utf8_lossy(&out.stdout).contains("private-token"));
+    let status = command(&["auth", "status", "--offline"])
+        .env("SPLUNK_URL", "https://unreachable.invalid:8089")
+        .env("SPLUNK_TOKEN", "private-token")
+        .output()
+        .unwrap();
+    assert_eq!(data(&status)["authenticated"], Value::Null);
+    let init = command(&["init"]).output().unwrap();
+    assert!(
+        error(&init, 2, "usage")["message"]
+            .as_str()
+            .unwrap()
+            .contains("terminal")
+    );
+}
+
+#[tokio::test]
+async fn doctor_identifies_a_permission_failure_and_keeps_completed_checks() {
+    let server = MockServer::start().await;
+    Mock::given(method("GET"))
+        .and(path("/services/authentication/current-context"))
+        .respond_with(
+            ResponseTemplate::new(403)
+                .set_body_json(json!({"messages":[{"text":"permission denied"}]})),
+        )
+        .expect(1)
+        .mount(&server)
+        .await;
+    let out = run(&server, &["doctor"]).await;
+    let failure = error(&out, 3, "auth");
+    assert!(
+        failure["hint"]
+            .as_str()
+            .unwrap()
+            .contains("role permissions")
+    );
+    assert_eq!(failure["details"]["checks"][0]["status"], "ok");
+    assert_eq!(failure["details"]["checks"][3]["check"], "authentication");
+    assert_eq!(failure["details"]["checks"][3]["status"], "failed");
+}
+
+#[tokio::test]
+async fn exports_preserve_values_and_requested_field_order_while_tables_fit_the_terminal() {
+    let server = MockServer::start().await;
+    Mock::given(method("GET")).and(path("/services/data/indexes"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({"entry": [
+            {"name":"main", "content":{"note":"a,\"b\"\nline", "totalEventCount":"1200", "currentDBSizeMB":"25", "ignored":"extra"}},
+            {"name":"very-long-index-name-that-needs-truncation", "content":{"note":null,"totalEventCount":"0"}}
+        ],"paging":{"total":2}}))).mount(&server).await;
+    let csv = run(
+        &server,
+        &["indexes", "list", "--fields", "name,note", "-o", "csv"],
+    )
+    .await;
+    assert!(
+        csv.status.success(),
+        "{}",
+        String::from_utf8_lossy(&csv.stderr)
+    );
+    assert_eq!(
+        String::from_utf8(csv.stdout).unwrap(),
+        "name,note\nmain,\"a,\"\"b\"\"\nline\"\nvery-long-index-name-that-needs-truncation,\n"
+    );
+    let jsonl = run(
+        &server,
+        &["indexes", "list", "--fields", "name", "-o", "jsonl"],
+    )
+    .await;
+    assert!(jsonl.status.success());
+    let lines: Vec<Value> = String::from_utf8(jsonl.stdout)
+        .unwrap()
+        .lines()
+        .map(|line| serde_json::from_str(line).unwrap())
+        .collect();
+    assert_eq!(
+        lines,
+        vec![
+            json!({"name":"main"}),
+            json!({"name":"very-long-index-name-that-needs-truncation"})
+        ]
+    );
+    let mut cmd = command(&["indexes", "list", "-o", "table"]);
+    cmd.env("SPLUNK_URL", server.uri())
+        .env("SPLUNK_TOKEN", "test-secret")
+        .env("COLUMNS", "56");
+    let text = tokio::task::spawn_blocking(move || cmd.output().unwrap())
+        .await
+        .unwrap();
+    assert!(
+        text.status.success(),
+        "{}",
+        String::from_utf8_lossy(&text.stderr)
+    );
+    let text = String::from_utf8(text.stdout).unwrap();
+    assert!(text.starts_with("NAME"), "{text}");
+    assert!(!text.contains("ignored"));
+    assert!(!text.contains("\"main\""));
+    assert!(
+        text.lines().all(|line| line.chars().count() <= 56),
+        "{text}"
+    );
+    assert!(text.contains('…'));
+}
+
+#[test]
+fn spl_files_and_stdin_share_validation_and_dry_run_never_submits() {
+    use std::io::Write;
+    let dir = tempfile::tempdir().unwrap();
+    let file = dir.path().join("query.spl");
+    std::fs::write(&file, "\u{feff}| makeresults\n| eval message=\"hello\"\n").unwrap();
+    let out = command(&["search", "--file", file.to_str().unwrap(), "--dry-run"])
+        .env("SPLUNK_URL", "https://offline.invalid:8089")
+        .output()
+        .unwrap();
+    assert_eq!(
+        data(&out)["parameters"]["search"],
+        "| makeresults\n| eval message=\"hello\""
+    );
+    let mut child = command(&["jobs", "create", "--file", "-", "--dry-run"])
+        .env("SPLUNK_URL", "https://offline.invalid:8089")
+        .stdin(std::process::Stdio::piped())
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped())
+        .spawn()
+        .unwrap();
+    child
+        .stdin
+        .take()
+        .unwrap()
+        .write_all(b"index=main\n| head 2\n")
+        .unwrap();
+    assert_eq!(
+        data(&child.wait_with_output().unwrap())["parameters"]["search"],
+        "search index=main\n| head 2"
+    );
+    error(
+        &command(&["search", "index=main", "--file", file.to_str().unwrap()])
+            .output()
+            .unwrap(),
+        2,
+        "usage",
+    );
+    error(
+        &command(&[
+            "search",
+            "--cursor",
+            "job-1:2",
+            "--file",
+            file.to_str().unwrap(),
+        ])
+        .output()
+        .unwrap(),
+        2,
+        "usage",
+    );
+    std::fs::write(&file, vec![b'x'; 1024 * 1024 + 1]).unwrap();
+    error(
+        &command(&["search", "--file", file.to_str().unwrap(), "--dry-run"])
+            .output()
+            .unwrap(),
+        2,
+        "usage",
+    );
+}
+
+#[tokio::test]
+async fn watch_polls_an_existing_job_and_keeps_progress_off_stdout() {
+    use std::sync::{
+        Arc,
+        atomic::{AtomicUsize, Ordering},
+    };
+    let server = MockServer::start().await;
+    let calls = Arc::new(AtomicUsize::new(0));
+    Mock::given(method("GET")).and(path("/servicesNS/nobody/search/search/jobs/job-1"))
+        .respond_with(move |_: &wiremock::Request| {
+            let done = calls.fetch_add(1, Ordering::SeqCst) > 0;
+            ResponseTemplate::new(200).set_body_json(entries(json!({"isDone":done,"dispatchState":if done {"DONE"} else {"RUNNING"},"doneProgress":if done {1.0} else {0.5},"scanCount":"20","resultCount":"3"})))
+        }).expect(3).mount(&server).await;
+    let out = run(
+        &server,
+        &[
+            "jobs",
+            "watch",
+            "job-1",
+            "--interval",
+            "1",
+            "--wait-timeout",
+            "5",
+        ],
+    )
+    .await;
+    assert_eq!(data(&out)["job_id"], "job-1");
+    assert_eq!(data(&out)["dispatchState"], "DONE");
+    let progress = String::from_utf8(out.stderr).unwrap();
+    assert!(progress.contains("RUNNING"), "{progress}");
+    assert!(progress.contains("50%"), "{progress}");
+    let out = run(&server, &["jobs", "wait", "job-1", "--quiet"]).await;
+    assert_eq!(data(&out)["isDone"], true);
+    assert!(out.stderr.is_empty());
+    // Three GETs across the two commands, no submission or cancel request.
+    assert_eq!(server.received_requests().await.unwrap().len(), 3);
+}
+
+#[tokio::test]
+async fn bounded_export_reads_pages_of_one_job_and_returns_a_continuation() {
+    let server = MockServer::start().await;
+    Mock::given(method("GET"))
+        .and(path("/servicesNS/nobody/search/search/jobs/job-1"))
+        .respond_with(
+            ResponseTemplate::new(200)
+                .set_body_json(entries(json!({"isDone":true,"resultCount":"5"}))),
+        )
+        .expect(1)
+        .mount(&server)
+        .await;
+    for (offset, count, items) in [
+        ("0", "3", json!([{"n":"1"},{"n":"2"},{"n":"3"}])),
+        ("2", "2", json!([{"n":"3"},{"n":"4"}])),
+    ] {
+        Mock::given(method("GET"))
+            .and(path(
+                "/servicesNS/nobody/search/search/v2/jobs/job-1/results",
+            ))
+            .and(query_param("offset", offset))
+            .and(query_param("count", count))
+            .respond_with(
+                ResponseTemplate::new(200).set_body_json(json!({"results":items,"preview":false})),
+            )
+            .expect(1)
+            .mount(&server)
+            .await;
+    }
+    let out = run(
+        &server,
+        &[
+            "jobs",
+            "export",
+            "job-1",
+            "--max-results",
+            "3",
+            "--page-size",
+            "2",
+        ],
+    )
+    .await;
+    let value = data(&out);
+    assert_eq!(value["items"], json!([{"n":"1"},{"n":"2"},{"n":"3"}]));
+    assert_eq!(value["job_id"], "job-1");
+    assert_eq!(value["has_more"], true);
+    assert_eq!(value["next_cursor"], "job-1:3");
+    assert_eq!(value["next_offset"], 3);
+    assert_eq!(value["limit"], 3);
+    assert!(
+        server
+            .received_requests()
+            .await
+            .unwrap()
+            .iter()
+            .all(|r| r.method == "GET")
+    );
+}
+
+#[test]
+fn new_command_contracts_describe_effects_bounded_exports_and_offline_auth() {
+    let spec = data(&command(&["schema"]).output().unwrap());
+    let commands = spec["commands"].as_array().unwrap();
+    let find = |name: &str| commands.iter().find(|c| c["name"] == name).unwrap();
+    for name in ["init", "profile use", "profile remove"] {
+        assert_eq!(find(name)["effects"], "idempotent");
+    }
+    assert_eq!(
+        find("jobs export")["pagination"]["limit_arg"],
+        "--max-results"
+    );
+    assert_eq!(find("profile list")["cardinality"], "bounded");
+    let auth = jsonschema::validator_for(&find("auth status")["stdout_schema"]).unwrap();
+    assert!(auth.is_valid(&json!({"authenticated":null,"offline":true,"profile":"default","url":"https://host:8089/","credentials":{"source":"environment","available":true,"verified":false,"method":"token"}})));
+    let removal = jsonschema::validator_for(&find("profile remove")["stdout_schema"]).unwrap();
+    assert!(removal.is_valid(
+        &json!({"dry_run":true,"profile":"work","action":"remove","url":"https://host:8089"})
+    ));
+}
+
+#[tokio::test]
+async fn authorization_diagnostics_redact_encoded_basic_credentials_and_explain_permissions() {
+    let server = MockServer::start().await;
+    Mock::given(method("GET"))
+        .and(path("/services/server/info"))
+        .respond_with(ResponseTemplate::new(403).set_body_json(
+            json!({"messages":[{"text":"Rejected Basic dXNlcjpwYXNzd29yZA== password"}]}),
+        ))
+        .mount(&server)
+        .await;
+    let mut cmd = command(&["server", "info"]);
+    cmd.env("SPLUNK_URL", server.uri())
+        .env("SPLUNK_USERNAME", "user")
+        .env("SPLUNK_PASSWORD", "password");
+    let out = tokio::task::spawn_blocking(move || cmd.output().unwrap())
+        .await
+        .unwrap();
+    let failure = error(&out, 3, "auth");
+    assert!(!String::from_utf8_lossy(&out.stderr).contains("dXNlcjpwYXNzd29yZA=="));
+    assert!(
+        failure["hint"]
+            .as_str()
+            .unwrap()
+            .contains("role permissions")
+    );
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn ctrl_c_preserves_the_job_and_returns_recovery_details() {
+    let server = MockServer::start().await;
+    Mock::given(method("GET"))
+        .and(path("/servicesNS/nobody/search/search/jobs/job-1"))
+        .respond_with(
+            ResponseTemplate::new(200)
+                .set_body_json(entries(json!({"isDone":false,"dispatchState":"RUNNING"}))),
+        )
+        .mount(&server)
+        .await;
+    let mut child = command(&["jobs", "watch", "job-1", "--quiet", "--interval", "60"])
+        .env("SPLUNK_URL", server.uri())
+        .env("SPLUNK_TOKEN", "test-secret")
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped())
+        .spawn()
+        .unwrap();
+    let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(10);
+    while server.received_requests().await.unwrap().is_empty()
+        && tokio::time::Instant::now() < deadline
+    {
+        tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+    }
+    assert!(
+        Command::new("kill")
+            .args(["-INT", &child.id().to_string()])
+            .status()
+            .unwrap()
+            .success()
+    );
+    while child.try_wait().unwrap().is_none() && tokio::time::Instant::now() < deadline {
+        tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+    }
+    if child.try_wait().unwrap().is_none() {
+        child.kill().unwrap();
+    }
+    let failure = error(&child.wait_with_output().unwrap(), 130, "interrupted");
+    assert_eq!(failure["details"]["job_id"], "job-1");
+    assert!(
+        failure["hint"]
+            .as_str()
+            .unwrap()
+            .contains("jobs results job-1")
+    );
+    assert!(
+        server
+            .received_requests()
+            .await
+            .unwrap()
+            .iter()
+            .all(|r| r.method == "GET")
+    );
+}
+
+#[test]
+fn profile_previews_hide_invalid_urls_and_settings_can_be_removed_without_keyring_access() {
+    let dir = tempfile::tempdir().unwrap();
+    let config = dir.path().join("config.toml");
+    std::fs::write(
+        &config,
+        "[profiles.work]\nurl='https://user:private-secret@host:8089'\n",
+    )
+    .unwrap();
+    let invoke = |args: &[&str]| {
+        command(args)
+            .env("SPLUNK_CONFIG", &config)
+            .output()
+            .unwrap()
+    };
+    let listed = data(&invoke(&["profile", "list"]));
+    assert_eq!(listed["items"][0]["valid"], false);
+    assert_eq!(listed["items"][0]["url"], Value::Null);
+    let preview = data(&invoke(&["profile", "remove", "work", "--dry-run"]));
+    assert_eq!(preview["url"], Value::Null);
+    assert!(!preview.to_string().contains("private-secret"));
+    assert!(!dir.path().join("config.toml.lock").exists());
+    error(&invoke(&["profile", "use", "work"]), 2, "usage");
+    let removed = data(&invoke(&[
+        "profile",
+        "remove",
+        "work",
+        "--keep-credentials",
+        "--yes",
+    ]));
+    assert_eq!(removed["removed"], true);
+    assert_eq!(removed["credentials_removed"], Value::Null);
+    assert!(
+        data(&invoke(&["profile", "list"]))["items"]
+            .as_array()
+            .unwrap()
+            .is_empty()
+    );
+}
+
+#[tokio::test]
+async fn export_failure_never_emits_partial_records_and_empty_pages_stop_continuation() {
+    for failure in [true, false] {
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/servicesNS/nobody/search/search/jobs/job-1"))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .set_body_json(entries(json!({"isDone":true,"resultCount":"5"}))),
+            )
+            .mount(&server)
+            .await;
+        Mock::given(method("GET"))
+            .and(path(
+                "/servicesNS/nobody/search/search/v2/jobs/job-1/results",
+            ))
+            .and(query_param("offset", "0"))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .set_body_json(json!({"results":[{"n":"1"},{"n":"2"},{"n":"3"}]})),
+            )
+            .expect(1)
+            .mount(&server)
+            .await;
+        Mock::given(method("GET"))
+            .and(path(
+                "/servicesNS/nobody/search/search/v2/jobs/job-1/results",
+            ))
+            .and(query_param("offset", "2"))
+            .respond_with(if failure {
+                ResponseTemplate::new(500)
+            } else {
+                ResponseTemplate::new(200).set_body_json(json!({"results":[]}))
+            })
+            .expect(1)
+            .mount(&server)
+            .await;
+        let out = run(
+            &server,
+            &[
+                "jobs",
+                "export",
+                "job-1",
+                "--max-results",
+                "5",
+                "--page-size",
+                "2",
+                "--output",
+                if failure { "csv" } else { "json" },
+            ],
+        )
+        .await;
+        if failure {
+            assert_eq!(error(&out, 5, "api")["details"]["job_id"], "job-1");
+        } else {
+            let value = data(&out);
+            assert_eq!(value["items"], json!([{"n":"1"},{"n":"2"}]));
+            assert_eq!(value["truncated"], true);
+            assert_eq!(value["has_more"], false);
+            assert_eq!(value["next_cursor"], Value::Null);
+        }
+    }
+}
+
+#[tokio::test]
+async fn a_closed_stderr_pipeline_does_not_panic() {
+    let server = MockServer::start().await;
+    Mock::given(method("GET")).and(path("/services/server/info"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({"entry":[{"name":"server","content":{"version":"10"}}],"messages":[{"type":"WARN","text":"warning"}]})))
+        .mount(&server).await;
+    let (reader, writer) = std::io::pipe().unwrap();
+    drop(reader);
+    let mut cmd = command(&["server", "info"]);
+    cmd.env("SPLUNK_URL", server.uri())
+        .env("SPLUNK_TOKEN", "fixture")
+        .stderr(writer);
+    let out = tokio::task::spawn_blocking(move || cmd.output().unwrap())
+        .await
+        .unwrap();
+    assert!(out.status.success(), "{:?}", out.status);
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn ctrl_c_still_works_while_fetching_results_after_waiting() {
+    let server = MockServer::start().await;
+    Mock::given(method("POST"))
+        .and(path("/servicesNS/nobody/search/search/jobs"))
+        .respond_with(ResponseTemplate::new(201).set_body_json(json!({"sid":"job-1"})))
+        .mount(&server)
+        .await;
+    completed(&server).await;
+    Mock::given(method("GET"))
+        .and(path(
+            "/servicesNS/nobody/search/search/v2/jobs/job-1/results",
+        ))
+        .respond_with(
+            ResponseTemplate::new(200)
+                .set_delay(std::time::Duration::from_secs(30))
+                .set_body_json(json!({"results":[]})),
+        )
+        .mount(&server)
+        .await;
+    let mut child = command(&["search", "| makeresults", "--quiet"])
+        .env("SPLUNK_URL", server.uri())
+        .env("SPLUNK_TOKEN", "fixture")
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped())
+        .spawn()
+        .unwrap();
+    let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(5);
+    while !server
+        .received_requests()
+        .await
+        .unwrap()
+        .iter()
+        .any(|r| r.url.path().ends_with("/results"))
+        && tokio::time::Instant::now() < deadline
+    {
+        tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+    }
+    Command::new("kill")
+        .args(["-INT", &child.id().to_string()])
+        .status()
+        .unwrap();
+    while child.try_wait().unwrap().is_none() && tokio::time::Instant::now() < deadline {
+        tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+    }
+    if child.try_wait().unwrap().is_none() {
+        child.kill().unwrap();
+    }
+    assert_eq!(
+        error(&child.wait_with_output().unwrap(), 130, "interrupted")["details"]["job_id"],
+        "job-1"
+    );
+}
+
+#[tokio::test]
+async fn export_byte_bound_returns_records_and_a_precise_continuation() {
+    let server = MockServer::start().await;
+    Mock::given(method("GET"))
+        .and(path("/servicesNS/nobody/search/search/jobs/job-1"))
+        .respond_with(
+            ResponseTemplate::new(200)
+                .set_body_json(entries(json!({"isDone":true,"resultCount":"5000"}))),
+        )
+        .mount(&server)
+        .await;
+    let row = json!({"payload":"x".repeat(8192)});
+    Mock::given(method("GET"))
+        .and(path(
+            "/servicesNS/nobody/search/search/v2/jobs/job-1/results",
+        ))
+        .respond_with(move |request: &wiremock::Request| {
+            let offset: usize = request
+                .url
+                .query_pairs()
+                .find(|(key, _)| key == "offset")
+                .unwrap()
+                .1
+                .parse()
+                .unwrap();
+            ResponseTemplate::new(200)
+                .set_body_json(json!({"results":vec![row.clone(); (5000-offset).min(1001)]}))
+        })
+        .mount(&server)
+        .await;
+    let out = run(&server, &["jobs", "export", "job-1"]).await;
+    let value = data(&out);
+    assert_eq!(value["items"].as_array().unwrap().len(), 4088);
+    assert_eq!(value["next_offset"], 4088);
+    assert_eq!(value["next_cursor"], "job-1:4088");
+    assert_eq!(value["byte_limit_reached"], true);
+    assert_eq!(value["bounded"], true);
+    assert!(serde_json::to_vec(&value["items"]).unwrap().len() <= 32 * 1024 * 1024);
+}
+
+#[tokio::test]
+async fn splunk_error_text_is_actionable_redacted_and_keeps_job_recovery() {
+    let server = MockServer::start().await;
+    completed(&server).await;
+    Mock::given(method("GET"))
+        .and(path(
+            "/servicesNS/nobody/search/search/v2/jobs/job-1/results",
+        ))
+        .respond_with(ResponseTemplate::new(200).set_body_json(
+            json!({"messages":[{"type":"ERROR","text":"Lookup missing; supplied test-secret"}]}),
+        ))
+        .mount(&server)
+        .await;
+    let failure = error(&run(&server, &["jobs", "results", "job-1"]).await, 5, "api");
+    assert_eq!(failure["message"], "Lookup missing; supplied [REDACTED]");
+    assert!(
+        failure["hint"]
+            .as_str()
+            .unwrap()
+            .contains("jobs results job-1")
+    );
+}
+
+#[tokio::test]
+async fn repeated_splunk_warnings_are_shown_once_per_invocation() {
+    let server = MockServer::start().await;
+    Mock::given(method("GET"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+            "entry":[{"name":"job-1","content":{"isDone":true,"resultCount":"1"}}],
+            "results":[{"value":"one"}],"messages":[{"type":"WARN","text":"Same warning"}]
+        })))
+        .mount(&server)
+        .await;
+    let out = run(&server, &["jobs", "results", "job-1"]).await;
+    assert_eq!(data(&out)["items"], json!([{"value":"one"}]));
+    assert_eq!(
+        String::from_utf8_lossy(&out.stderr)
+            .matches("Warning: Same warning")
+            .count(),
+        1
+    );
+}
+
+#[cfg(unix)]
+#[test]
+fn config_updates_preserve_symlinks() {
+    let dir = tempfile::tempdir().unwrap();
+    let target = dir.path().join("actual.toml");
+    let alias = dir.path().join("config.toml");
+    std::fs::write(
+        &target,
+        "[profiles.default]\nurl='https://old.example:8089'\n",
+    )
+    .unwrap();
+    std::os::unix::fs::symlink(&target, &alias).unwrap();
+    let out = command(&["config", "set", "--url", "https://new.example:8089"])
+        .env("SPLUNK_CONFIG", &alias)
+        .output()
+        .unwrap();
+    assert_eq!(data(&out)["saved"], true);
+    assert!(alias.is_symlink());
+    assert!(
+        std::fs::read_to_string(&target)
+            .unwrap()
+            .contains("https://new.example:8089")
+    );
+}
+
+#[cfg(unix)]
+#[test]
+fn non_utf8_paths_return_structured_errors_instead_of_panicking() {
+    use std::os::unix::ffi::OsStringExt;
+    let path = std::ffi::OsString::from_vec(b"/tmp/splunk-\xff".to_vec());
+    let out = command(&["config", "path"])
+        .env("SPLUNK_CONFIG", &path)
+        .output()
+        .unwrap();
+    error(&out, 2, "usage");
+    let out = command(&[
+        "config",
+        "show",
+        "--url",
+        "https://example.invalid:8089",
+        "--ca-cert",
+    ])
+    .arg(path)
+    .output()
+    .unwrap();
+    error(&out, 2, "usage");
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn ctrl_c_interrupts_a_blocked_output_writer() {
+    use std::io::Read;
+    let server = MockServer::start().await;
+    Mock::given(method("GET"))
+        .and(path("/servicesNS/nobody/search/search/jobs/job-1"))
+        .respond_with(
+            ResponseTemplate::new(200)
+                .set_body_json(entries(json!({"isDone":true,"large":"x".repeat(512*1024)}))),
+        )
+        .mount(&server)
+        .await;
+    let mut child = command(&["jobs", "wait", "job-1", "--quiet"])
+        .env("SPLUNK_URL", server.uri())
+        .env("SPLUNK_TOKEN", "fixture")
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped())
+        .spawn()
+        .unwrap();
+    let pid = child.id();
+    let reading = tokio::task::spawn_blocking(move || {
+        child
+            .stdout
+            .as_mut()
+            .unwrap()
+            .read_exact(&mut [0u8; 1])
+            .unwrap();
+        child
+    });
+    let mut child = match tokio::time::timeout(std::time::Duration::from_secs(10), reading).await {
+        Ok(result) => result.unwrap(),
+        Err(_) => {
+            Command::new("kill")
+                .args(["-KILL", &pid.to_string()])
+                .status()
+                .unwrap();
+            panic!("No output within 10 seconds");
+        }
+    };
+    Command::new("kill")
+        .args(["-INT", &pid.to_string()])
+        .status()
+        .unwrap();
+    let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(3);
+    while child.try_wait().unwrap().is_none() && tokio::time::Instant::now() < deadline {
+        tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+    }
+    if child.try_wait().unwrap().is_none() {
+        child.kill().unwrap();
+    }
+    let out = child.wait_with_output().unwrap();
+    assert_eq!(out.status.code(), Some(130));
+    let stderr = String::from_utf8(out.stderr).unwrap();
+    let error: Value = serde_json::from_str(stderr.lines().last().unwrap()).unwrap();
+    assert_eq!(error["error"]["kind"], "interrupted");
+    assert_eq!(error["error"]["details"]["job_id"], "job-1");
+}
+
+#[test]
+fn text_usage_errors_keep_readable_lines_and_one_error_prefix() {
+    let out = command(&["--output", "text", "--unknown"])
+        .output()
+        .unwrap();
+    let text = String::from_utf8(out.stderr).unwrap();
+    assert!(text.starts_with("Error: unexpected argument"), "{text}");
+    assert!(text.contains("\n\nUsage:"), "{text}");
+    assert!(!text.contains("\\n"));
+}
+
+#[tokio::test]
+async fn json_errors_escape_terminal_controls_without_changing_decoded_messages() {
+    let server = MockServer::start().await;
+    let message = "Rejected \u{009b}31m\u{202e}value";
+    Mock::given(method("GET"))
+        .respond_with(
+            ResponseTemplate::new(400).set_body_json(json!({"messages":[{"text":message}]})),
+        )
+        .mount(&server)
+        .await;
+    let out = run(&server, &["server", "info", "--output", "json"]).await;
+    assert_eq!(error(&out, 2, "usage")["message"], message);
+    assert!(!String::from_utf8_lossy(&out.stderr).contains(['\u{009b}', '\u{202e}']));
+}
+
+#[test]
+fn missing_ca_certificates_have_configuration_context_and_recovery_hints() {
+    let dir = tempfile::tempdir().unwrap();
+    for args in [&["doctor", "--offline"][..], &["config", "set"]] {
+        let mut cmd = command(args);
+        cmd.env("SPLUNK_CONFIG", dir.path().join("config.toml"));
+        cmd.args([
+            "--url",
+            "https://example.invalid:8089",
+            "--ca-cert",
+            "/nonexistent/splunk-cli-missing-ca.pem",
+        ])
+        .env("SPLUNK_TOKEN", "fixture");
+        let failure = error(&cmd.output().unwrap(), 2, "usage");
+        assert!(
+            failure["message"]
+                .as_str()
+                .unwrap()
+                .contains("CA certificate")
+        );
+        assert!(failure["hint"].as_str().unwrap().contains("--ca-cert"));
+    }
+}
+
+#[cfg(windows)]
+#[tokio::test]
+async fn detached_windows_processes_can_wait_without_a_console_handler() {
+    use std::os::windows::process::CommandExt;
+    let server = MockServer::start().await;
+    completed(&server).await;
+    let mut cmd = command(&["jobs", "wait", "job-1", "--quiet"]);
+    cmd.creation_flags(0x00000008) // DETACHED_PROCESS: no console for Ctrl-C registration.
+        .env("SPLUNK_URL", server.uri())
+        .env("SPLUNK_TOKEN", "fixture");
+    let out = tokio::task::spawn_blocking(move || cmd.output().unwrap())
+        .await
+        .unwrap();
+    assert_eq!(data(&out)["job_id"], "job-1");
+}
+
+#[tokio::test]
+async fn raw_event_tables_show_event_context_without_internal_splunk_columns() {
+    let server = MockServer::start().await;
+    completed(&server).await;
+    Mock::given(method("GET")).and(path("/servicesNS/nobody/search/search/v2/jobs/job-1/results"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({"results":[{"_raw":"raw-message","_time":"2026-11-03T12:00:00Z","host":"fixture","_bkt":"internal-bucket","_cd":"internal-position"}]})))
+        .mount(&server).await;
+    let out = run(&server, &["jobs", "results", "job-1", "--output", "text"]).await;
+    assert!(out.status.success());
+    let text = String::from_utf8(out.stdout).unwrap();
+    assert!(text.contains("raw-message"));
+    assert!(text.contains("_TIME"));
+    assert!(!text.contains("_BKT"));
+    assert!(!text.contains("internal-bucket"));
+}
+
+#[tokio::test]
+async fn file_login_integrates_with_active_profiles_diagnostics_and_scoped_removal() {
+    use std::io::Write;
+    use std::process::Stdio;
+    let server = MockServer::start().await;
+    Mock::given(method("GET"))
+        .and(path("/services/authentication/current-context"))
+        .and(header("authorization", "Bearer file-test-token"))
+        .respond_with(
+            ResponseTemplate::new(200).set_body_json(entries(json!({"username": "test"}))),
+        )
+        .expect(3)
+        .mount(&server)
+        .await;
+    let dir = tempfile::tempdir().unwrap();
+    let config = dir.path().join("config.toml");
+    let config = config.to_str().unwrap().to_owned();
+    let url = server.uri();
+    let first = tokio::task::spawn_blocking(move || {
+        let login = |name: &str| {
+            let mut child = command(&[
+                "init",
+                "--profile",
+                name,
+                "--config",
+                &config,
+                "--url",
+                &url,
+                "--web-url",
+                "https://web.invalid/splunk/",
+                "--token-stdin",
+                "--insecure-storage",
+            ])
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .spawn()
+            .unwrap();
+            child
+                .stdin
+                .take()
+                .unwrap()
+                .write_all(b"file-test-token\n")
+                .unwrap();
+            data(&child.wait_with_output().unwrap())
+        };
+        assert_eq!(login("work")["credential_store"], "file");
+        assert_eq!(login("other")["credential_store"], "file");
+        config
+    })
+    .await
+    .unwrap();
+    let invoke = |args: &[&str]| {
+        let mut all = vec!["--config", &first];
+        all.extend_from_slice(args);
+        command(&all).output().unwrap()
+    };
+    data(&invoke(&["profile", "use", "work"]));
+    let status = data(&invoke(&["auth", "status", "--offline"]));
+    assert_eq!(status["profile"], "work");
+    assert_eq!(status["credentials"]["source"], "file");
+    assert!(status["authenticated"].is_null());
+    let doctor = data(&invoke(&["doctor", "--offline"]));
+    assert_eq!(doctor["credentials"]["source"], "file");
+    assert_eq!(
+        data(&invoke(&["config", "show"]))["web_url"],
+        "https://web.invalid/splunk/"
+    );
+    let config = first.clone();
+    let online = tokio::task::spawn_blocking(move || {
+        command(&["--config", &config, "auth", "status"])
+            .output()
+            .unwrap()
+    })
+    .await
+    .unwrap();
+    assert_eq!(data(&online)["authenticated"], true);
+    let removed = data(&invoke(&["profile", "remove", "work", "--yes"]));
+    assert_eq!(removed["credentials_removed"], true);
+    let remaining: Value =
+        serde_json::from_slice(&std::fs::read(dir.path().join("credentials.json")).unwrap())
+            .unwrap();
+    assert_eq!(remaining.as_object().unwrap().len(), 1);
+    data(&invoke(&["profile", "use", "other"]));
+    assert_eq!(
+        data(&invoke(&["auth", "status", "--offline"]))["credentials"]["source"],
+        "file"
+    );
+    data(&invoke(&["profile", "remove", "other", "--yes"]));
+    let remaining: Value =
+        serde_json::from_slice(&std::fs::read(dir.path().join("credentials.json")).unwrap())
+            .unwrap();
+    assert!(remaining.as_object().unwrap().is_empty());
+    let schema = data(&command(&["schema", "init"]).output().unwrap());
+    assert!(
+        schema["commands"][0]["args"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|arg| arg["name"] == "--browser")
+    );
+}
+
+#[test]
+fn config_cannot_collide_with_the_credential_store() {
+    let dir = tempfile::tempdir().unwrap();
+    let config = dir.path().join("credentials.json");
+    let out = command(&[
+        "auth",
+        "login",
+        "--url",
+        "https://splunk.invalid:8089",
+        "--config",
+        config.to_str().unwrap(),
+        "--token-stdin",
+        "--insecure-storage",
+    ])
+    .output()
+    .unwrap();
+    let failure = error(&out, 2, "usage");
+    assert!(failure["message"].as_str().unwrap().contains("reserved"));
+    assert!(!config.exists());
+}

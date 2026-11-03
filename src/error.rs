@@ -56,6 +56,12 @@ pub const KINDS: &[(&str, u8, bool, &str)] = &[
         "Splunk returned an unexpected response.",
     ),
     ("io", 12, false, "Local filesystem or output failure."),
+    (
+        "interrupted",
+        130,
+        false,
+        "Wait interrupted; the existing job is preserved.",
+    ),
 ];
 
 #[derive(Debug)]

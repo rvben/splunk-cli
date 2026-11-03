@@ -11,7 +11,10 @@ fn argument(arg: &clap::Arg) -> Value {
         .unwrap_or_else(|| id.to_owned());
     let kind = if !arg.get_action().takes_values() {
         "boolean"
-    } else if matches!(id, "limit" | "offset" | "timeout" | "wait_timeout") {
+    } else if matches!(
+        id,
+        "limit" | "offset" | "timeout" | "wait_timeout" | "interval" | "max_results" | "page_size"
+    ) {
         "integer"
     } else if matches!(id, "fields" | "command") {
         "string[]"
@@ -44,7 +47,10 @@ fn argument(arg: &clap::Arg) -> Value {
     {
         value["enum"] = json!(
             possible
-                .map(|v| v.get_name().to_owned())
+                .flat_map(|v| v
+                    .get_name_and_aliases()
+                    .map(str::to_owned)
+                    .collect::<Vec<_>>())
                 .collect::<Vec<_>>()
         );
     }
@@ -52,10 +58,13 @@ fn argument(arg: &clap::Arg) -> Value {
 }
 
 fn describe(command: &clap::Command, name: &str) -> Value {
-    let collection = command.get_arguments().any(|a| a.get_id() == "limit");
+    let collection = command
+        .get_arguments()
+        .any(|a| matches!(a.get_id().as_str(), "limit" | "max_results"));
     let effects = match name {
         "search" | "jobs create" | "saved-searches run" => "non_idempotent",
-        "jobs cancel" | "jobs delete" | "config set" | "auth login" | "auth logout" => "idempotent",
+        "jobs cancel" | "jobs delete" | "config set" | "auth login" | "auth logout" | "init"
+        | "profile use" | "profile remove" => "idempotent",
         _ => "read_only",
     };
     let args: Vec<_> = command
@@ -76,7 +85,7 @@ fn describe(command: &clap::Command, name: &str) -> Value {
         if name == "search" {
             value["pagination"] = json!({"style": "cursor", "cursor_field": "next_cursor", "cursor_arg": "--cursor", "limit_arg": "--limit"});
             value["x-pagination-note"] = json!(
-                "Pass next_cursor to search --cursor without a query to reuse the existing job, or use jobs results JOB_ID."
+                "With --cursor this command is read-only and reuses the existing job; without --cursor it submits a non-idempotent search. Pass next_cursor without a query, or use jobs results JOB_ID."
             );
         }
     }
@@ -84,7 +93,7 @@ fn describe(command: &clap::Command, name: &str) -> Value {
         "jobs create" | "saved-searches run" => {
             value["stdout_schema"] = json!({"type": "object", "required": ["job_id"], "properties": {"job_id": {"type": "string"}}});
         }
-        "jobs results" | "search" => {
+        "jobs results" | "jobs export" | "search" => {
             value["stdout_schema"]["required"]
                 .as_array_mut()
                 .unwrap()
@@ -101,7 +110,7 @@ fn describe(command: &clap::Command, name: &str) -> Value {
             value["stdout_schema"] = json!({"type": "object", "required": ["job_id", "action", "success", "changed"], "properties": {
                 "job_id": {"type": "string"}, "action": {"enum": ["cancel", "delete"]}, "success": {"type": "boolean"}, "changed": {"type": "boolean"}}});
         }
-        "auth login" => {
+        "auth login" | "init" => {
             value["stdout_schema"] = json!({"type": "object", "required": ["authenticated", "profile", "url", "credential_store", "method", "environment_credentials"], "properties": {
                 "authenticated": {"const": true}, "profile": {"type": "string"}, "url": {"type": "string"},
                 "credential_store": {"enum": ["keyring", "file"]}, "method": {"enum": ["token", "password", "session"]}, "environment_credentials": {"type": "boolean"}}});
@@ -114,8 +123,39 @@ fn describe(command: &clap::Command, name: &str) -> Value {
                 "profile": {"type": "string"}, "url": {"type": "string"}, "removed": {"type": "boolean"}, "environment_credentials": {"type": "boolean"}}});
         }
         "auth status" => {
-            value["stdout_schema"] = json!({"type": "object", "required": ["authenticated", "context"], "properties": {
-            "authenticated": {"const": true}, "context": {"type": "object"}}})
+            value["stdout_schema"] = json!({"oneOf": [
+                {"type": "object", "required": ["authenticated", "context"], "properties": {"authenticated": {"const": true}, "context": {"type": "object"}}},
+                {"type": "object", "required": ["authenticated", "offline", "profile", "url", "credentials"], "properties": {"authenticated": {"type": "null"}, "offline": {"const": true}, "profile": {"type": "string"}, "url": {"type": "string"}, "credentials": {"type": "object"}}}
+            ]});
+            value["x-offline-note"] = json!(
+                "--offline checks local credential availability; authenticated is null because credentials have not been verified against Splunk."
+            );
+        }
+        "doctor" => {
+            value["stdout_schema"] = json!({"type": "object", "required": ["ok", "offline", "profile", "url", "credentials", "checks"], "properties": {
+                "ok": {"const": true}, "offline": {"type": "boolean"}, "profile": {"type": "string"}, "url": {"type": "string"}, "credentials": {"type": "object"},
+                "checks": {"type": "array", "items": {"type": "object", "required": ["check", "status", "message"], "properties": {"check": {"type": "string"}, "status": {"enum": ["ok", "warning", "failed"]}, "message": {"type": "string"}}}}}});
+            value["x-failure-note"] = json!(
+                "Failures use the standard error envelope and exit code; details.checks contains completed checks and the failed check. No search is submitted."
+            );
+        }
+        "jobs wait" | "jobs watch" => {
+            value["stdout_schema"] = json!({"type": "object", "required": ["job_id", "isDone"], "properties": {"job_id": {"type": "string"}}});
+            value["x-progress-note"] = json!(
+                "Watch progress goes to stderr, final state to stdout. Timeout and Ctrl-C preserve the job and return its ID in error.details.job_id."
+            );
+        }
+        "profile list" => {
+            value["cardinality"] = json!("bounded");
+            value["stdout_schema"] = json!({"type": "object", "required": ["items", "active_profile", "default_profile"], "properties": {
+                "items": {"type": "array", "items": {"type": "object"}}, "active_profile": {"type": "string"}, "default_profile": {"type": "string"}}});
+        }
+        "profile use" => {
+            value["stdout_schema"] = json!({"type": "object", "required": ["active_profile"], "properties": {"active_profile": {"type": "string"}}});
+        }
+        "profile remove" => {
+            value["stdout_schema"] = json!({"type": "object", "required": ["removed", "profile", "credentials_removed", "active_profile"], "properties": {
+                "removed": {"const": true}, "profile": {"type": "string"}, "credentials_removed": {"type": ["boolean", "null"]}, "active_profile": {"type": "string"}}});
         }
         "config path" => {
             value["stdout_schema"] = json!({"type": "object", "required": ["path"], "properties": {"path": {"type": "string"}}})
@@ -130,6 +170,8 @@ fn describe(command: &clap::Command, name: &str) -> Value {
         let normal = value["stdout_schema"].clone();
         let preview = if name == "config set" {
             json!({"type": "object", "required": ["dry_run", "settings"], "properties": {"dry_run": {"const": true}, "settings": {"type": "object"}}})
+        } else if name == "profile remove" {
+            json!({"type": "object", "required": ["dry_run", "profile", "action", "url"], "properties": {"dry_run": {"const": true}, "profile": {"type": "string"}, "action": {"const": "remove"}, "url": {"type": ["string", "null"]}}})
         } else {
             json!({"type": "object", "required": ["dry_run", "method", "url", "parameters"], "properties": {
                 "dry_run": {"const": true}, "method": {"enum": ["POST", "DELETE"]}, "url": {"type": "string"}, "parameters": {"type": "object", "additionalProperties": {"type": "string"}}}})
@@ -139,12 +181,26 @@ fn describe(command: &clap::Command, name: &str) -> Value {
     if command.get_arguments().any(|a| a.get_id() == "fields") {
         value["fields_arg"] = json!("--fields");
     }
-    if matches!(name, "jobs cancel" | "jobs delete") {
+    if matches!(name, "jobs cancel" | "jobs delete" | "profile remove") {
         value["confirmation_bypass_arg"] = json!("--yes");
     }
     if effects == "non_idempotent" {
         value["x-retry-note"] = json!(
             "No automatic retries. Splunk does not provide an idempotency key for this workflow. Inspect the existing job before resubmitting; SPL may write data."
+        );
+    }
+    if name == "jobs export" {
+        for key in ["bounded", "byte_limit_reached"] {
+            value["stdout_schema"]["required"]
+                .as_array_mut()
+                .unwrap()
+                .push(json!(key));
+            value["stdout_schema"]["properties"][key] = json!({"type": "boolean"});
+        }
+        value["pagination"] =
+            json!({"style": "offset", "limit_arg": "--max-results", "offset_arg": "--offset"});
+        value["x-export-note"] = json!(
+            "Reads only the named completed job. Stops at --max-results or 32 MiB of record JSON and returns a continuation. Resume with next_offset or use next_cursor with search --cursor. CSV/JSONL emit records only; pagination metadata is on stderr."
         );
     }
     if name == "schema" {
@@ -180,7 +236,7 @@ pub fn contract() -> Value {
         "global_args": cli.get_arguments().filter(|a| a.is_global_set()).map(argument).collect::<Vec<_>>(),
         "commands": commands,
         "errors": KINDS.iter().map(|(kind, code, retryable, description)| json!({"kind": kind, "exit_code": code, "retryable": retryable, "description": description})).collect::<Vec<_>>(),
-        "extensions": {"credential_env_vars": ["SPLUNK_TOKEN", "SPLUNK_SESSION_KEY", "SPLUNK_USERNAME", "SPLUNK_PASSWORD"]}})
+        "extensions": {"record_formats": ["csv", "jsonl"], "warnings": "Splunk WARN messages go to stderr even with --quiet. Closed stdout pipelines exit successfully.", "credential_env_vars": ["SPLUNK_TOKEN", "SPLUNK_SESSION_KEY", "SPLUNK_USERNAME", "SPLUNK_PASSWORD"]}})
 }
 
 pub fn filtered(prefix: &str) -> Result<Value> {

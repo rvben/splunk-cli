@@ -1,6 +1,8 @@
 """Opt-in public CLI checks against the disposable server from test-live.sh."""
 
 import base64
+import csv
+import io
 import json
 import os
 from pathlib import Path
@@ -28,7 +30,7 @@ JOBS = []
 TOKENS = []
 SAVED = "splunk-cli-live-" + ROOT.name.rsplit("-", 1)[-1]
 SAVED_CREATED = False
-PROFILES = ("password", "token", "expires", "other")
+PROFILES = ("password", "token", "expires", "other", "remove-test")
 
 
 class ApiError(AssertionError):
@@ -49,7 +51,7 @@ def cli(*args, profile="password", env=None, stdin=None, code=0, config=None, ur
     assert not any(s in result.stdout + result.stderr for s in SECRETS), "CLI leaked a secret"
     expected = (code,) if isinstance(code, int) else code
     assert result.returncode in expected, f"{args[:2]}: expected exit {code}, got {result.returncode}: {result.stderr}"
-    value = json.loads(result.stdout if result.returncode == 0 else result.stderr)
+    value = json.loads(result.stdout if result.returncode == 0 else result.stderr.splitlines()[-1])
     if result.returncode:
         assert value["error"]["exit_code"] == result.returncode
         if result.returncode == 3:
@@ -107,8 +109,8 @@ def wait_kvstore():
     raise AssertionError(f"Splunk KV Store did not become ready within 180 seconds (status={status})")
 
 
-def interactive_login(method, secret, profile="password", code=0):
-    args = ["auth", "login", "--method", method]
+def interactive_login(method, secret, profile="password", code=0, init=False):
+    args = (["init"] if init else ["auth", "login"]) + ["--method", method]
     if method == "password":
         args += ["--username", "admin"]
     pid, terminal = pty.fork()
@@ -195,7 +197,7 @@ def make_token(expiry):
 
 
 def check_auth():
-    interactive_login("password", PASSWORD)
+    interactive_login("password", PASSWORD, init=True)
     assert_authenticated()
     invalid = "invalid-test-credential"
     SECRETS.append(invalid)
@@ -257,6 +259,42 @@ def wait_job(job):
     raise AssertionError("Search job did not complete within 120 seconds")
 
 
+def formatted(format, *args, stdin=None):
+    args = command(args)
+    args[args.index("--output") + 1] = format
+    result = subprocess.run(args, env=ENV | {"COLUMNS": "80"}, input=stdin,
+                            capture_output=True, text=True, timeout=180)
+    assert not any(s in result.stdout + result.stderr for s in SECRETS), "CLI leaked a secret"
+    assert result.returncode == 0, f"Formatted output failed: {result.stderr}"
+    return result
+
+
+def check_experience():
+    status = cli("auth", "status", "--offline")
+    assert status["authenticated"] is None and status["credentials"]["source"] == "keyring"
+    assert status["credentials"]["verified"] is False
+    assert cli("doctor", "--offline")["ok"] is True
+    report = cli("doctor")
+    assert report["ok"] is True and report["credentials"]["verified"] is True
+    assert all(check["status"] in ("ok", "warning") for check in report["checks"])
+    cli("profile", "use", "password")
+    args = command(["config", "show"])
+    index = args.index("--profile")
+    del args[index:index + 2]
+    selected = subprocess.run(args, env=ENV, capture_output=True, text=True, timeout=30)
+    assert selected.returncode == 0 and json.loads(selected.stdout)["profile"] == "password"
+    assert any(item["name"] == "password" and item["active"] for item in cli("profile", "list")["items"])
+    interactive_login("password", PASSWORD, profile="remove-test")
+    preview = cli("profile", "remove", "remove-test", "--dry-run")
+    assert preview["dry_run"] is True
+    assert_authenticated("remove-test")
+    removed = cli("profile", "remove", "remove-test", "--yes")
+    assert removed["removed"] is True and removed["credentials_removed"] is True
+    cli("auth", "status", profile="remove-test", code=3)
+    assert_authenticated()
+    print("PASS: init, saved active profile, offline status, online/offline doctor and scoped profile removal", flush=True)
+
+
 def check_workflows():
     global SAVED_CREATED
     indexes = cli("indexes", "list", "--limit", "5", "--fields", "name")["items"]
@@ -275,9 +313,35 @@ def check_workflows():
         {"row": str(row), "message": "splunk-cli-live"} for row in (1, 2, 3)]
     print("PASS: real SPL search, field projection and reusable pagination cursor", flush=True)
 
+    exported = cli("jobs", "export", first["job_id"], "--page-size", "1", "--max-results", "2", "--fields", "row,message")
+    assert exported["items"] == first["items"] and exported["bounded"] is True
+    assert exported["next_offset"] == 2
+    rest = cli("jobs", "export", first["job_id"], "--offset", "2", "--fields", "row,message")
+    assert rest["items"] == second["items"] and rest["bounded"] is False
+    jsonl = formatted("jsonl", "jobs", "export", first["job_id"], "--page-size", "1", "--fields", "row,message")
+    assert [json.loads(line) for line in jsonl.stdout.splitlines()] == first["items"] + second["items"]
+    csv_result = formatted("csv", "jobs", "export", first["job_id"], "--fields", "row,message")
+    assert list(csv.reader(io.StringIO(csv_result.stdout))) == [["row", "message"], ["1", "splunk-cli-live"], ["2", "splunk-cli-live"], ["3", "splunk-cli-live"]]
+    table = formatted("table", "indexes", "list", "--limit", "3")
+    assert table.stdout.startswith("NAME") and "EVENTS" in table.stdout
+    assert all(len(line) <= 80 for line in table.stdout.splitlines())
+    print("PASS: bounded multi-page export, resume, CSV/JSONL and terminal tables", flush=True)
+
+    source = ROOT / "query.spl"
+    source.write_text('| makeresults | eval message="file-live" | table message')
+    for args, stdin in [(("--file", str(source)), None), (("--file", "-"), source.read_text())]:
+        result = cli("search", *args, "--fields", "message", stdin=stdin)
+        JOBS.append(result["job_id"])
+        assert result["items"] == [{"message": "file-live"}]
+    print("PASS: SPL files and piped stdin against Splunk", flush=True)
+
+
     job = cli("jobs", "create", '| makeresults | eval message="async-live"')["job_id"]
     JOBS.append(job)
-    wait_job(job)
+    waited = cli("jobs", "wait", job)
+    assert waited["job_id"] == job
+    watched = cli("jobs", "watch", job, "--quiet")
+    assert watched["job_id"] == job and watched["isDone"] in (True, 1, "1")
     assert cli("jobs", "results", job, "--fields", "message")["items"] == [{"message": "async-live"}]
     assert len(cli("jobs", "list", "--limit", "5")["items"]) <= 5
     assert cli("jobs", "cancel", job, "--yes")["changed"] is True
@@ -330,6 +394,7 @@ def main():
     print(f"PASS: authenticated public CLI against Splunk {version}", flush=True)
     try:
         check_auth()
+        check_experience()
         check_workflows()
     except Exception as original:
         try:

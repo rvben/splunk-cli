@@ -2,6 +2,7 @@ use crate::{
     Error, Result,
     config::{Settings, validate_segment},
 };
+use base64::Engine;
 use reqwest::{
     Method, Url,
     header::{AUTHORIZATION, HeaderMap, HeaderValue},
@@ -48,18 +49,27 @@ impl Credentials {
     }
 
     fn redact(&self, text: &str) -> String {
-        let secrets: Vec<&str> = match self {
-            Self::Bearer(token) | Self::Session(token) => vec![token],
-            Self::Basic(_, password) => vec![password],
+        let secrets = match self {
+            Self::Bearer(token) | Self::Session(token) => vec![token.clone()],
+            Self::Basic(user, password) => vec![
+                base64::engine::general_purpose::STANDARD.encode(format!("{user}:{password}")),
+                password.clone(),
+            ],
         };
         secrets.into_iter().fold(text.into(), |s, secret| {
             if secret.is_empty() {
                 s
             } else {
-                s.replace(secret, "[REDACTED]")
+                s.replace(&secret, "[REDACTED]")
             }
         })
     }
+}
+
+#[derive(Default)]
+struct Warnings {
+    seen: std::collections::HashSet<String>,
+    suppressed: bool,
 }
 
 pub struct Client {
@@ -68,6 +78,7 @@ pub struct Client {
     credentials: Credentials,
     /// Set when the credentials were saved by `auth login`, so auth failures say how to recover.
     relogin_hint: bool,
+    warnings: std::sync::Mutex<Warnings>,
 }
 
 pub fn endpoint(settings: &Settings, namespaced: bool, segments: &[&str]) -> Result<Url> {
@@ -126,7 +137,7 @@ impl Client {
             .retry(reqwest::retry::never())
             .danger_accept_invalid_certs(settings.insecure);
         if let Some(path) = &settings.ca_cert {
-            let pem = std::fs::read(path)?;
+            let pem = std::fs::read(path).map_err(|error| crate::config::ca_error(path, error))?;
             let certs = reqwest::Certificate::from_pem_bundle(&pem)
                 .map_err(|_| Error::usage("CA certificate must contain PEM certificates"))?;
             if certs.is_empty() {
@@ -144,6 +155,7 @@ impl Client {
             settings,
             credentials,
             relogin_hint: false,
+            warnings: Default::default(),
         })
     }
 
@@ -211,29 +223,72 @@ impl Client {
                 .unwrap_or_else(|| format!("Splunk returned HTTP {}", status.as_u16()));
             let mut details = json!({"http_status": status.as_u16()});
             if let Some(delay) = retry_after {
-                details["retry_after"] = json!(delay);
+                details["retry_after"] = json!(
+                    self.credentials
+                        .redact(&delay)
+                        .chars()
+                        .take(256)
+                        .collect::<String>()
+                );
             }
             let mut error =
                 Error::new(kind, message.chars().take(2048).collect::<String>()).details(details);
-            if self.relogin_hint && status.as_u16() == 401 {
-                error = error.hint(
-                    "The saved credentials expired or were revoked; run splunk-cli auth login",
-                );
-            }
+            error.hint = match status.as_u16() {
+                401 if self.relogin_hint => Some("The saved credentials expired or were revoked; run splunk-cli auth login".into()),
+                401 => Some("Run splunk-cli auth login; expired or revoked credentials need replacing. Check environment credentials, which override the saved login.".into()),
+                403 => Some("Check your Splunk role permissions for this API and the selected --app / --owner.".into()),
+                _ => None,
+            };
             return Err(error);
         }
         if body.is_empty() {
             return Ok(json!({}));
         }
         let value = parsed.map_err(|_| Error::invalid_response())?;
-        if value["messages"].as_array().is_some_and(|messages| {
+        if let Some(messages) = value["messages"].as_array() {
+            for message in messages.iter().filter(|m| m["type"] == "WARN") {
+                if let Some(text) = message["text"].as_str() {
+                    let text: String = self.credentials.redact(text).chars().take(2048).collect();
+                    let mut seen = self
+                        .warnings
+                        .lock()
+                        .unwrap_or_else(|poisoned| poisoned.into_inner());
+                    if seen.seen.contains(&text) {
+                        continue;
+                    }
+                    if seen.seen.len() >= 64 {
+                        if !seen.suppressed {
+                            seen.suppressed = true;
+                            crate::output::diagnostic(format_args!(
+                                "Warning: additional Splunk warnings suppressed after 64 distinct messages"
+                            ));
+                        }
+                        continue;
+                    }
+                    seen.seen.insert(text.clone());
+                    drop(seen);
+                    crate::output::diagnostic(format_args!(
+                        "Warning: {}",
+                        crate::output::terminal(&text)
+                    ));
+                }
+            }
+        }
+        if let Some(message) = value["messages"].as_array().and_then(|messages| {
             messages
                 .iter()
-                .any(|m| matches!(m["type"].as_str(), Some("ERROR" | "FATAL")))
+                .find(|m| matches!(m["type"].as_str(), Some("ERROR" | "FATAL")))
         }) {
+            let text = message["text"]
+                .as_str()
+                .unwrap_or("Splunk reported an error in the response");
             return Err(Error::new(
                 "api",
-                "Splunk reported an error in the response",
+                self.credentials
+                    .redact(text)
+                    .chars()
+                    .take(2048)
+                    .collect::<String>(),
             ));
         }
         Ok(value)

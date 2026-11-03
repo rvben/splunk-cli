@@ -1,8 +1,10 @@
 use crate::{
     Error, Result, auth,
-    cli::{Auth, Cli, Command, Config, Indexes, Jobs, Page, SavedSearches, Server},
+    cli::{Auth, Cli, Command, Config, Indexes, Jobs, Page, Profiles, SavedSearches, Server},
     client::{Client, endpoint},
-    config, output,
+    config,
+    interrupt::run as interrupt,
+    output,
 };
 use reqwest::Method;
 use serde_json::{Value, json};
@@ -33,8 +35,10 @@ fn query_parameters(query: &str, earliest: &str, latest: &str) -> Result<Vec<(St
 }
 
 fn client(cli: &Cli) -> Result<Client> {
-    let settings = config::resolve(&cli.connection)?;
-    let credentials = auth::credentials(&cli.connection, &settings)?;
+    let mut options = cli.connection.clone();
+    options.profile = Some(config::profile_name(&options)?);
+    let settings = config::resolve(&options)?;
+    let credentials = auth::credentials(&options, &settings)?;
     let client = Client::new(settings, credentials)?;
     Ok(if auth::environment_credentials() {
         client
@@ -59,28 +63,49 @@ fn plan(
 
 pub async fn execute(cli: &Cli) -> Result<Value> {
     match &cli.command {
+        Command::Profile(Profiles::List) => config::profiles(&cli.connection),
+        Command::Profile(Profiles::Use { name }) => {
+            config::change_profile(&cli.connection, name, config::ProfileAction::Use)
+        }
+        Command::Profile(Profiles::Remove {
+            name,
+            yes,
+            dry_run,
+            keep_credentials,
+        }) => {
+            if !yes && !dry_run {
+                return Err(Error::new(
+                    "confirmation_required",
+                    "Removing a profile requires --yes",
+                )
+                .hint("Preview with --dry-run, then pass --yes"));
+            }
+            config::change_profile(
+                &cli.connection,
+                name,
+                config::ProfileAction::Remove {
+                    dry_run: *dry_run,
+                    keep_credentials: *keep_credentials,
+                },
+            )
+        }
         Command::Config(Config::Path) => Ok(json!({"path": config::path(&cli.connection)?})),
         Command::Config(Config::Show) => config::show(&cli.connection),
         Command::Config(Config::Set { dry_run }) => config::save(&cli.connection, *dry_run),
-        Command::Auth(Auth::Login {
-            method,
-            username,
-            token_stdin,
-            browser,
-            insecure_storage,
-        }) => {
+        Command::Init(login) | Command::Auth(Auth::Login(login)) => {
             auth::login(
                 cli,
                 auth::LoginRequest {
-                    method: *method,
-                    username: username.as_deref(),
-                    token_stdin: *token_stdin,
-                    browser: browser.clone(),
-                    insecure_storage: *insecure_storage,
+                    method: login.method,
+                    username: login.username.as_deref(),
+                    token_stdin: login.token_stdin,
+                    browser: login.browser.clone(),
+                    insecure_storage: login.insecure_storage,
                 },
             )
             .await
         }
+        Command::Doctor { offline } => doctor(cli, *offline).await,
         Command::Auth(Auth::Logout) => auth::logout(&cli.connection),
         Command::Search(search) => {
             if let Some(cursor) = &search.cursor {
@@ -100,34 +125,20 @@ pub async fn execute(cli: &Cli) -> Result<Value> {
                     .await
                     .map_err(|e| with_job(e, sid));
             }
-            let query = search
-                .query
-                .as_deref()
-                .ok_or_else(|| Error::usage("Supply a query or --cursor"))?;
-            let params = query_parameters(query, &search.earliest, &search.latest)?;
+            let query = read_query(search.query.as_deref(), search.file.as_deref())?;
+            let params = query_parameters(&query, &search.earliest, &search.latest)?;
             if search.dry_run {
                 return plan(cli, "POST", true, &["search", "jobs"], &params);
             }
             let client = client(cli)?;
             let sid = create(&client, &["search", "jobs"], &params).await?;
             if !cli.quiet {
-                eprintln!(
+                crate::output::diagnostic(format_args!(
                     "Created search job {}; waiting for completion",
                     output::terminal(&sid)
-                );
+                ));
             }
-            let waited = tokio::time::timeout(
-                Duration::from_secs(search.wait_timeout),
-                wait(&client, &sid),
-            )
-            .await;
-            let state = match waited {
-                Ok(result) => result,
-                Err(_) => Err(Error::new(
-                    "timeout",
-                    "Timed out waiting for search completion; the job is still available",
-                )),
-            };
+            let state = wait_for(&client, &sid, search.wait_timeout, None, false).await;
             let result = match state {
                 Ok(state) => results(&client, &sid, &search.page, Some(state)).await,
                 Err(error) => Err(error),
@@ -135,7 +146,8 @@ pub async fn execute(cli: &Cli) -> Result<Value> {
             result.map_err(|error| with_job(error, &sid))
         }
         Command::Jobs(Jobs::Create(query)) => {
-            let params = query_parameters(&query.query, &query.earliest, &query.latest)?;
+            let text = read_query(query.query.as_deref(), query.file.as_deref())?;
+            let params = query_parameters(&text, &query.earliest, &query.latest)?;
             if query.dry_run {
                 return plan(cli, "POST", true, &["search", "jobs"], &params);
             }
@@ -151,6 +163,23 @@ pub async fn execute(cli: &Cli) -> Result<Value> {
         Command::Jobs(Jobs::Results { id, page }) => results(&client(cli)?, id, page, None)
             .await
             .map_err(|e| with_job(e, id)),
+        Command::Jobs(Jobs::Export(export)) => export_results(&client(cli)?, export)
+            .await
+            .map_err(|error| with_job(error, &export.id)),
+        Command::Jobs(Jobs::Wait(monitor) | Jobs::Watch(monitor)) => {
+            let progress = matches!(cli.command, Command::Jobs(Jobs::Watch(_))) && !cli.quiet;
+            let mut state = wait_for(
+                &client(cli)?,
+                &monitor.id,
+                monitor.wait_timeout,
+                Some(monitor.interval),
+                progress,
+            )
+            .await
+            .map_err(|error| with_job(error, &monitor.id))?;
+            state["job_id"] = json!(monitor.id);
+            Ok(state)
+        }
         Command::Jobs(Jobs::Cancel { id, yes, dry_run })
         | Command::Jobs(Jobs::Delete { id, yes, dry_run }) => {
             let cancel = matches!(cli.command, Command::Jobs(Jobs::Cancel { .. }));
@@ -207,7 +236,14 @@ pub async fn execute(cli: &Cli) -> Result<Value> {
         Command::Server(Server::Info { fields }) => {
             show(&client(cli)?, false, &["server", "info"], fields).await
         }
-        Command::Auth(Auth::Status) => {
+        Command::Auth(Auth::Status { offline: true }) => {
+            let settings = config::resolve(&cli.connection)?;
+            Ok(
+                json!({"authenticated": null, "offline": true, "profile": config::profile_name(&cli.connection)?,
+                "url": settings.url.as_str(), "credentials": auth::status(&cli.connection, &settings)?}),
+            )
+        }
+        Command::Auth(Auth::Status { offline: false }) => {
             let user = show(
                 &client(cli)?,
                 false,
@@ -225,14 +261,21 @@ pub async fn execute(cli: &Cli) -> Result<Value> {
 
 fn with_job(mut error: Error, id: &str) -> Error {
     error.details["job_id"] = json!(id);
-    error.hint = Some(format!(
+    let recovery = format!(
         "Inspect with splunk-cli jobs show {id}; fetch completed results with splunk-cli jobs results {id}. Do not blindly resubmit SPL."
-    ));
+    );
+    error.hint = Some(match error.hint.take() {
+        Some(hint) => format!("{hint} {recovery}"),
+        None => recovery,
+    });
     error
 }
 
 async fn create(client: &Client, path: &[&str], params: &[(String, String)]) -> Result<String> {
-    let value = client.request(Method::POST, true, path, params).await?;
+    let value = interrupt(client.request(Method::POST, true, path, params)).await.map_err(|mut error| {
+        if error.kind == "interrupted" { error.hint = Some("A job may have been created. Inspect splunk-cli jobs list before resubmitting SPL.".into()); }
+        error
+    })?;
     let sid = value["sid"]
         .as_str()
         .filter(|s| !s.is_empty())
@@ -326,19 +369,53 @@ fn check_state(state: &Value) -> Result<bool> {
     Ok(truthy(&state["isDone"]))
 }
 
-async fn wait(client: &Client, sid: &str) -> Result<Value> {
-    let mut delay = Duration::from_millis(500);
+async fn wait(client: &Client, sid: &str, interval: Option<u64>, progress: bool) -> Result<Value> {
+    let mut delay = interval
+        .map(Duration::from_secs)
+        .unwrap_or(Duration::from_millis(500));
     loop {
         let state = show(client, true, &["search", "jobs", sid], &[]).await?;
-        if check_state(&state)? {
+        let done = check_state(&state)?;
+        if progress {
+            let percent = state["doneProgress"]
+                .as_f64()
+                .or_else(|| state["doneProgress"].as_str().and_then(|s| s.parse().ok()))
+                .filter(|number| number.is_finite())
+                .unwrap_or(if done { 1.0 } else { 0.0 })
+                .clamp(0.0, 1.0)
+                * 100.0;
+            crate::output::diagnostic(format_args!(
+                "{}: {} {percent:.0}%; scanned {}; results {}",
+                output::terminal(sid),
+                output::terminal(state["dispatchState"].as_str().unwrap_or("RUNNING")),
+                output::number(&state["scanCount"])
+                    .map(|n| n.to_string())
+                    .unwrap_or_else(|| "?".into()),
+                output::number(&state["resultCount"])
+                    .map(|n| n.to_string())
+                    .unwrap_or_else(|| "?".into())
+            ));
+        }
+        if done {
             return Ok(state);
         }
         tokio::time::sleep(delay).await;
-        delay = (delay * 2).min(Duration::from_secs(5));
+        if interval.is_none() {
+            delay = (delay * 2).min(Duration::from_secs(5));
+        }
     }
 }
 
 async fn results(client: &Client, sid: &str, page: &Page, state: Option<Value>) -> Result<Value> {
+    interrupt(results_inner(client, sid, page, state)).await
+}
+
+async fn results_inner(
+    client: &Client,
+    sid: &str,
+    page: &Page,
+    state: Option<Value>,
+) -> Result<Value> {
     let state = match state {
         Some(state) => state,
         None => show(client, true, &["search", "jobs", sid], &[]).await?,
@@ -384,4 +461,218 @@ async fn results(client: &Client, sid: &str, page: &Page, state: Option<Value>) 
         .map(|offset| json!(format!("{sid}:{offset}")))
         .unwrap_or(Value::Null);
     Ok(result)
+}
+
+async fn doctor(cli: &Cli, offline: bool) -> Result<Value> {
+    let mut checks = Vec::new();
+    let mut options = cli.connection.clone();
+    options.profile = Some(
+        config::profile_name(&options)
+            .map_err(|error| diagnostic(error, "configuration", &checks))?,
+    );
+    let settings =
+        config::resolve(&options).map_err(|error| diagnostic(error, "configuration", &checks))?;
+    checks.push(json!({"check": "configuration", "status": "ok", "message": "Management URL and namespace are valid"}));
+    let (secret, credentials) = auth::load_status(&options, &settings)
+        .map_err(|error| diagnostic(error, "credentials", &checks))?;
+    checks.push(json!({"check": "credentials", "status": "ok", "message": format!("{} credentials available; not yet verified", credentials["source"].as_str().unwrap_or("saved"))}));
+    let client = Client::new(settings.clone(), secret)
+        .map_err(|error| diagnostic(error, "transport_configuration", &checks))?;
+    let client = if credentials["source"] == "environment" {
+        client
+    } else {
+        client.with_relogin_hint()
+    };
+    checks.push(json!({"check": "transport_configuration", "status": if settings.insecure { "warning" } else { "ok" },
+        "message": if settings.insecure { "TLS certificate verification is disabled for this invocation" } else { "HTTP client and certificate trust are configured" }}));
+    if offline {
+        return Ok(
+            json!({"ok": true, "offline": true, "profile": config::profile_name(&options)?, "url": settings.url.as_str(), "credentials": credentials, "checks": checks}),
+        );
+    }
+    let context = show(&client, false, &["authentication", "current-context"], &[])
+        .await
+        .map_err(|error| diagnostic(error, "authentication", &checks))?;
+    checks.push(json!({"check": "authentication", "status": "ok", "message": "Splunk accepted the credentials"}));
+    let server = show(&client, false, &["server", "info"], &[])
+        .await
+        .map_err(|error| diagnostic(error, "server", &checks))?;
+    checks
+        .push(json!({"check": "server", "status": "ok", "message": "Management API is reachable"}));
+    list(
+        &client,
+        true,
+        &["search", "jobs"],
+        &Page {
+            limit: 1,
+            offset: 0,
+            fields: vec!["name".into()],
+        },
+    )
+    .await
+    .map_err(|error| diagnostic(error, "namespace", &checks))?;
+    checks.push(json!({"check": "namespace", "status": "ok", "message": "Search jobs are readable in the selected app/owner namespace"}));
+    list(
+        &client,
+        false,
+        &["data", "indexes"],
+        &Page {
+            limit: 1,
+            offset: 0,
+            fields: vec!["name".into()],
+        },
+    )
+    .await
+    .map_err(|error| diagnostic(error, "indexes", &checks))?;
+    checks.push(
+        json!({"check": "indexes", "status": "ok", "message": "Visible indexes are readable"}),
+    );
+    let mut credentials = credentials;
+    credentials["verified"] = json!(true);
+    Ok(
+        json!({"ok": true, "offline": false, "profile": config::profile_name(&options)?, "url": settings.url.as_str(),
+        "credentials": credentials, "context": context, "server": server, "checks": checks}),
+    )
+}
+
+fn diagnostic(mut error: Error, check: &str, passed: &[Value]) -> Error {
+    let mut checks = passed.to_vec();
+    checks.push(json!({"check": check, "status": "failed", "message": error.message}));
+    error.details["checks"] = json!(checks);
+    if error.hint.is_none() {
+        error.hint = Some(match error.kind {
+            "auth" => "Run splunk-cli auth login; check environment overrides and your Splunk role permissions.",
+            "transport" => "Use the management port (usually 8089). For a private CA, pass --ca-cert PATH; use --insecure only for a trusted test server.",
+            "usage" => "Run splunk-cli init, or inspect splunk-cli config show and profile list.",
+            "invalid_response" => "Check that --url points to the Splunk management API (usually port 8089), rather than Splunk Web on port 8000.",
+            _ => "Inspect the failed check and retry splunk-cli doctor after correcting it.",
+        }.into());
+    }
+    error
+}
+
+fn read_query(query: Option<&str>, file: Option<&std::path::Path>) -> Result<String> {
+    use std::io::{IsTerminal, Read};
+    const MAX: usize = 1024 * 1024;
+    let query = if let Some(file) = file {
+        let mut reader: Box<dyn Read> = if file == std::path::Path::new("-") {
+            if std::io::stdin().is_terminal() {
+                return Err(Error::usage("--file - requires SPL piped to stdin"));
+            }
+            Box::new(std::io::stdin().lock())
+        } else {
+            Box::new(std::fs::File::open(file)?)
+        };
+        let mut bytes = Vec::new();
+        reader
+            .by_ref()
+            .take((MAX + 1) as u64)
+            .read_to_end(&mut bytes)?;
+        if bytes.len() > MAX {
+            return Err(Error::usage("SPL query exceeds 1 MiB"));
+        }
+        String::from_utf8(bytes)
+            .map_err(|_| Error::usage("SPL file must contain UTF-8 text"))?
+            .trim_start_matches('\u{feff}')
+            .to_owned()
+    } else {
+        query
+            .ok_or_else(|| Error::usage("Supply SPL or --file PATH (use - for stdin)"))?
+            .to_owned()
+    };
+    if query.len() > MAX {
+        return Err(Error::usage("SPL query exceeds 1 MiB"));
+    }
+    normalize_query(&query)
+}
+
+async fn wait_for(
+    client: &Client,
+    sid: &str,
+    timeout: u64,
+    interval: Option<u64>,
+    progress: bool,
+) -> Result<Value> {
+    config::validate_segment(sid, "job ID")?;
+    interrupt(async {
+        tokio::time::timeout(
+            Duration::from_secs(timeout),
+            wait(client, sid, interval, progress),
+        )
+        .await
+        .unwrap_or_else(|_| {
+            Err(Error::new(
+                "timeout",
+                "Timed out waiting for search completion; the job is still available",
+            ))
+        })
+    })
+    .await
+}
+
+async fn export_results(client: &Client, options: &crate::cli::Export) -> Result<Value> {
+    interrupt(export_results_inner(client, options)).await
+}
+
+async fn export_results_inner(client: &Client, options: &crate::cli::Export) -> Result<Value> {
+    let state = show(client, true, &["search", "jobs", &options.id], &[]).await?;
+    let mut items = Vec::new();
+    let mut bytes = 2;
+    let mut byte_bound = false;
+    let mut page = Page {
+        limit: options.page_size.min(options.max_results),
+        offset: options.offset,
+        fields: options.fields.clone(),
+    };
+    let mut last;
+    loop {
+        last = results(client, &options.id, &page, Some(state.clone())).await?;
+        let batch = last["items"].take();
+        let batch = match batch {
+            Value::Array(items) => items,
+            _ => return Err(Error::invalid_response()),
+        };
+        for item in batch {
+            let size = serde_json::to_vec(&item)
+                .map_err(|_| Error::invalid_response())?
+                .len()
+                + usize::from(!items.is_empty());
+            if bytes + size > 32 * 1024 * 1024 {
+                byte_bound = true;
+                break;
+            }
+            bytes += size;
+            items.push(item);
+        }
+        if byte_bound {
+            if items.is_empty() {
+                return Err(Error::new(
+                    "invalid_response",
+                    "One record exceeds the 32 MiB export bound; select --fields",
+                ));
+            }
+            let offset = options.offset + items.len() as u64;
+            last["has_more"] = json!(true);
+            last["next_offset"] = json!(offset);
+            last["next_cursor"] = json!(format!("{}:{offset}", options.id));
+            break;
+        }
+        if last["has_more"] != true || items.len() >= options.max_results as usize {
+            break;
+        }
+        page.offset = last["next_offset"]
+            .as_u64()
+            .filter(|offset| *offset > page.offset && *offset <= i64::MAX as u64)
+            .ok_or_else(Error::invalid_response)?;
+        page.limit = options
+            .page_size
+            .min(options.max_results - items.len() as u32);
+    }
+    last["items"] = Value::Array(items);
+    last["byte_limit_reached"] = json!(byte_bound);
+    last["offset"] = json!(options.offset);
+    last["limit"] = json!(options.max_results);
+    last["page_size"] = json!(options.page_size);
+    last["bounded"] = last["has_more"].clone();
+    Ok(last)
 }

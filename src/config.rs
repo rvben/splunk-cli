@@ -11,6 +11,8 @@ use std::{
 #[derive(Default, Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
 pub struct ConfigFile {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub active_profile: Option<String>,
     #[serde(default)]
     pub profiles: BTreeMap<String, Profile>,
 }
@@ -40,7 +42,7 @@ pub struct Settings {
 }
 
 pub fn path(options: &Connection) -> Result<PathBuf> {
-    options
+    let path = options
         .config
         .clone()
         .or_else(|| {
@@ -50,35 +52,35 @@ pub fn path(options: &Connection) -> Result<PathBuf> {
                 .or_else(|| dirs::home_dir().map(|p| p.join(".config")))
                 .map(|p| p.join("splunk-cli/config.toml"))
         })
-        .ok_or_else(|| Error::usage("Cannot determine the config path; set --config"))
+        .ok_or_else(|| Error::usage("Cannot determine the config path; set --config"))?;
+    if path.to_str().is_none() {
+        return Err(Error::usage("Configuration path must be UTF-8"));
+    }
+    Ok(path)
 }
 
 fn read(options: &Connection) -> Result<ConfigFile> {
     match fs::read_to_string(path(options)?) {
-        Ok(contents) => toml::from_str(&contents).map_err(|_| Error::usage("Invalid config file; expected [profiles.NAME] with url, web_url, app, owner, timeout, ca_cert (no credentials)")),
+        Ok(contents) => toml::from_str(&contents).map_err(|_| Error::usage("Invalid config file; expected optional active_profile and [profiles.NAME] with url, web_url, app, owner, timeout, ca_cert (no credentials)")),
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(ConfigFile::default()),
         Err(error) => Err(error.into()),
     }
 }
 
 pub fn configured_url(options: &Connection) -> Result<Option<String>> {
-    validate_segment(&options.profile, "profile")?;
+    let name = profile_name(options)?;
     let file = read(options)?;
     Ok(options.url.clone().or_else(|| {
         file.profiles
-            .get(&options.profile)
+            .get(&name)
             .and_then(|profile| profile.url.clone())
     }))
 }
 
 pub fn resolve(options: &Connection) -> Result<Settings> {
-    validate_segment(&options.profile, "profile")?;
+    let name = profile_name(options)?;
     let file = read(options)?;
-    let profile = file
-        .profiles
-        .get(&options.profile)
-        .cloned()
-        .unwrap_or_default();
+    let profile = file.profiles.get(&name).cloned().unwrap_or_default();
     let url = options
         .url
         .as_ref()
@@ -108,13 +110,17 @@ pub fn resolve(options: &Connection) -> Result<Settings> {
         Some(web_url) => validate_web_url(web_url)?,
         None => default_web_url(&url),
     };
+    let ca_cert = options.ca_cert.clone().or(profile.ca_cert);
+    if ca_cert.as_ref().is_some_and(|path| path.to_str().is_none()) {
+        return Err(Error::usage("CA certificate path must be UTF-8"));
+    }
     Ok(Settings {
         url,
         web_url,
         app,
         owner,
         timeout,
-        ca_cert: options.ca_cert.clone().or(profile.ca_cert),
+        ca_cert,
         insecure: options.insecure,
         allow_http: options.allow_http,
     })
@@ -186,7 +192,7 @@ pub fn validate_segment(value: &str, label: &str) -> Result<()> {
 pub fn show(options: &Connection) -> Result<serde_json::Value> {
     let settings = resolve(options)?;
     Ok(
-        serde_json::json!({"profile": options.profile, "config": path(options)?,
+        serde_json::json!({"profile": profile_name(options)?, "config": path(options)?,
         "url": settings.url.as_str(), "web_url": settings.web_url.as_str(), "app": settings.app, "owner": settings.owner,
         "timeout": settings.timeout, "ca_cert": settings.ca_cert, "insecure": settings.insecure}),
     )
@@ -194,14 +200,17 @@ pub fn show(options: &Connection) -> Result<serde_json::Value> {
 
 /// Serialize updates with a separate stable lock file, then replace atomically.
 pub fn save(options: &Connection, dry_run: bool) -> Result<serde_json::Value> {
+    let mut selected = options.clone();
+    selected.profile = Some(profile_name(options)?);
+    let options = &selected;
     let planned = show(options)?;
     if dry_run {
         return Ok(serde_json::json!({"dry_run": true, "settings": planned}));
     }
-    let config_path = path(options)?;
+    let config_path = write_path(options)?;
     let _lock = lock(&config_path)?;
     let mut file = read(options)?;
-    let profile = file.profiles.entry(options.profile.clone()).or_default();
+    let profile = file.profiles.entry(profile_name(options)?).or_default();
     if options.url.is_some() {
         profile.url = options.url.clone();
     }
@@ -218,12 +227,174 @@ pub fn save(options: &Connection, dry_run: bool) -> Result<serde_json::Value> {
         profile.timeout = options.timeout;
     }
     if let Some(ca_cert) = &options.ca_cert {
-        profile.ca_cert = Some(fs::canonicalize(ca_cert)?);
+        profile.ca_cert =
+            Some(fs::canonicalize(ca_cert).map_err(|error| ca_error(ca_cert, error))?);
     }
-    let contents = toml::to_string_pretty(&file)
-        .map_err(|_| Error::new("io", "Cannot serialize configuration"))?;
-    write_atomic(&config_path, contents.as_bytes())?;
+    persist(&file, &config_path)?;
     Ok(serde_json::json!({"saved": true, "settings": show(options)?}))
+}
+
+fn persist(file: &ConfigFile, config_path: &std::path::Path) -> Result<()> {
+    let contents = toml::to_string_pretty(file)
+        .map_err(|_| Error::new("io", "Cannot serialize configuration"))?;
+    write_atomic(config_path, contents.as_bytes())
+}
+
+pub fn profile_name(options: &Connection) -> Result<String> {
+    let name = match &options.profile {
+        Some(name) => name.clone(),
+        None => read(options)?
+            .active_profile
+            .unwrap_or_else(|| "default".into()),
+    };
+    validate_segment(&name, "profile")?;
+    Ok(name)
+}
+
+pub fn profiles(options: &Connection) -> Result<serde_json::Value> {
+    let file = read(options)?;
+    let selected = profile_name(options)?;
+    let items: Vec<_> = file
+        .profiles
+        .iter()
+        .map(|(name, profile)| {
+            serde_json::json!({
+                "name": name, "url": profile.url.as_deref().and_then(|url| validate_url(url).ok()).map(|url| url.to_string()), "valid": profile_problem(profile).is_none(), "problem": profile_problem(profile).map(|error| error.message), "app": profile.app.as_deref().unwrap_or("search"),
+                "owner": profile.owner.as_deref().unwrap_or("nobody"), "active": name == &selected,
+                "default": file.active_profile.as_deref().unwrap_or("default") == name
+            })
+        })
+        .collect();
+    Ok(
+        serde_json::json!({"items": items, "active_profile": selected,
+        "default_profile": file.active_profile.as_deref().unwrap_or("default")}),
+    )
+}
+
+/// All profile mutations share the settings writer's stable lock and atomic replacement.
+pub enum ProfileAction {
+    Use,
+    Remove {
+        dry_run: bool,
+        keep_credentials: bool,
+    },
+}
+
+pub fn change_profile(
+    options: &Connection,
+    name: &str,
+    action: ProfileAction,
+) -> Result<serde_json::Value> {
+    let (remove, dry_run, keep_credentials) = match action {
+        ProfileAction::Use => (false, false, false),
+        ProfileAction::Remove {
+            dry_run,
+            keep_credentials,
+        } => (true, dry_run, keep_credentials),
+    };
+    validate_segment(name, "profile")?;
+    let config_path = write_path(options)?;
+    let file = read(options)?;
+    let profile = stored_profile(&file, name)?;
+    if dry_run {
+        return Ok(
+            serde_json::json!({"dry_run": true, "profile": name, "action": "remove", "url": profile.url.as_deref().and_then(|url| validate_url(url).ok()).map(|url| url.to_string()), "keep_credentials": keep_credentials}),
+        );
+    }
+    let _lock = lock(&config_path)?;
+    let mut file = read(options)?;
+    let profile = stored_profile(&file, name)?;
+    if remove {
+        let mut scoped = options.clone();
+        scoped.profile = Some(name.into());
+        // Environment URL overrides must never redirect credential deletion.
+        scoped.url = profile.url.clone();
+        let settings = if keep_credentials {
+            None
+        } else {
+            profile.url.as_deref().map(|url| validate_url(url).map(|url| Settings {
+                web_url: default_web_url(&url), url, app: "search".into(), owner: "nobody".into(), timeout: 30, ca_cert: None, insecure: false, allow_http: false,
+            }).map_err(|error| error.hint("Use --keep-credentials to remove settings with an invalid URL; remove obsolete saved credentials separately"))).transpose()?
+        };
+        file.profiles.remove(name);
+        if file.active_profile.as_deref().unwrap_or("default") == name {
+            file.active_profile = None;
+        }
+        let removed = if let Some(settings) = settings {
+            Some(crate::auth::remove_for_profile(&scoped, &settings, || persist(&file, &config_path)).map_err(|mut error| {
+                if error.kind == "auth" { error.hint = Some(format!("{} To remove settings without changing saved credentials, use --keep-credentials.", error.hint.unwrap_or_default())); }
+                error
+            })?)
+        } else {
+            persist(&file, &config_path)?;
+            if keep_credentials { None } else { Some(false) }
+        };
+        if keep_credentials {
+            crate::output::diagnostic(format_args!(
+                "Warning: profile settings removed; saved credentials were kept. Remote tokens have not been revoked."
+            ));
+        }
+        Ok(
+            serde_json::json!({"removed": true, "profile": name, "credentials_removed": removed,
+            "active_profile": file.active_profile.as_deref().unwrap_or("default")}),
+        )
+    } else {
+        if let Some(error) = profile_problem(profile) {
+            return Err(error);
+        }
+        file.active_profile = Some(name.into());
+        persist(&file, &config_path)?;
+        Ok(serde_json::json!({"active_profile": name}))
+    }
+}
+
+fn stored_profile<'a>(file: &'a ConfigFile, name: &str) -> Result<&'a Profile> {
+    let profile = file
+        .profiles
+        .get(name)
+        .ok_or_else(|| Error::new("not_found", "Profile does not exist"))?;
+    Ok(profile)
+}
+
+fn profile_problem(profile: &Profile) -> Option<Error> {
+    let validate = || -> Result<()> {
+        if let Some(url) = &profile.url {
+            validate_url(url)?;
+        }
+        if let Some(web_url) = &profile.web_url {
+            validate_web_url(web_url)?;
+        }
+        if let Some(app) = &profile.app {
+            validate_segment(app, "app")?;
+        }
+        if let Some(owner) = &profile.owner {
+            validate_segment(owner, "owner")?;
+        }
+        if profile
+            .timeout
+            .is_some_and(|timeout| !(1..=3600).contains(&timeout))
+        {
+            return Err(Error::usage("timeout must be between 1 and 3600 seconds"));
+        }
+        Ok(())
+    };
+    validate().err()
+}
+
+/// Replace the target of a config symlink, preserving the user's dotfile link.
+fn write_path(options: &Connection) -> Result<PathBuf> {
+    let path = path(options)?;
+    match fs::symlink_metadata(&path) {
+        Ok(metadata) if metadata.file_type().is_symlink() => Ok(fs::canonicalize(path)?),
+        Ok(_) => Ok(path),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(path),
+        Err(error) => Err(error.into()),
+    }
+}
+
+pub(crate) fn ca_error(path: &std::path::Path, error: std::io::Error) -> Error {
+    Error::usage(format!("Cannot access CA certificate {}: {error}", path.display()))
+        .hint("Check --ca-cert, SPLUNK_CA_CERT, or the profile's ca_cert setting; provide a readable PEM certificate file")
 }
 
 fn parent(path: &Path) -> &Path {

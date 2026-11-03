@@ -6,6 +6,22 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/).
 
 ## [Unreleased]
 
+### Added
+
+- Guided `init`, read-only `doctor`, and offline credential diagnostics.
+- Persistent profile selection with `profile list`, `use`, and guarded `remove`.
+- Aligned terminal tables, CSV and JSONL exports, and SPL files or piped stdin.
+- Bounded `jobs wait` / `watch` and multi-page `jobs export` of an existing job.
+
+### Fixed
+
+- Surface sanitized, credential-redacted Splunk warnings even with `--quiet`.
+- Exit quietly when a pipeline consumer closes stdout.
+- Redact encoded Basic credentials in API diagnostics and explain permission failures.
+- Preserve config symlinks, improve CA and usage errors, and handle interrupted output.
+- Correct interactive-login documentation and expand command examples.
+- Keep saved-login diagnostics and profile removal consistent across keyring and file stores.
+
 ## [0.0.2](https://github.com/rvben/splunk-cli/compare/v0.0.1...v0.0.2) - 2026-11-03
 
 ### Added

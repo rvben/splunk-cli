@@ -27,8 +27,10 @@ on authorized test infrastructure.
 Coverage includes hidden terminal password/token prompts, piped token login,
 Linux Secret Service persistence, rejected credentials, environment precedence,
 profile/config/server isolation, token expiration and disabling, scoped logout,
-real SPL searches with pagination, asynchronous job management, saved search
-dispatch, index reads, and fixture cleanup. Token fixtures follow Splunk's
+`init`, online/offline diagnostics, active profile selection and scoped profile
+removal, real SPL from arguments/files/stdin, pagination, job wait/watch, bounded
+export and resume, CSV/JSONL, terminal tables, asynchronous job management, saved
+search dispatch, index reads, and fixture cleanup. Token fixtures follow Splunk's
 [creation](https://help.splunk.com/en/splunk-enterprise/administer/manage-users-and-security/10.2/authenticate-into-the-splunk-platform-with-tokens/create-authentication-tokens)
 and [management](https://help.splunk.com/en/splunk-enterprise/administer/manage-users-and-security/10.2/authenticate-into-the-splunk-platform-with-tokens/manage-or-delete-authentication-tokens)
 APIs. The suite changes token settings only on its disposable server.

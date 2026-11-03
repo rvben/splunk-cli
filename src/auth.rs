@@ -82,6 +82,15 @@ struct FileStore {
 impl FileStore {
     fn for_config(options: &Connection) -> Result<Self> {
         let config = config::path(options)?;
+        if config.file_name().is_some_and(|name| {
+            name.to_string_lossy()
+                .eq_ignore_ascii_case("credentials.json")
+        }) {
+            return Err(Error::usage(
+                "The config filename credentials.json is reserved for saved credentials",
+            )
+            .hint("Use --config with a separate filename, such as config.toml"));
+        }
         Ok(Self {
             path: config.with_file_name("credentials.json"),
         })
@@ -150,7 +159,7 @@ impl Store for FileStore {
 }
 
 fn account(options: &Connection, settings: &Settings) -> Result<String> {
-    config::validate_segment(&options.profile, "profile")?;
+    let profile = config::profile_name(options)?;
     let path = std::path::absolute(config::path(options)?)?;
     // Resolve existing parent aliases, including when nested config directories
     // do not exist yet. The identity stays stable across the first config save.
@@ -161,7 +170,7 @@ fn account(options: &Connection, settings: &Settings) -> Result<String> {
     let mut hash = Sha256::new();
     hash.update(path.as_os_str().as_encoded_bytes());
     hash.update(b"\0");
-    hash.update(options.profile.as_bytes());
+    hash.update(profile.as_bytes());
     hash.update(b"\0");
     hash.update(settings.url.as_str().as_bytes());
     Ok(format!("profile:{:x}", hash.finalize()))
@@ -185,8 +194,17 @@ fn resolve_credentials(
     settings: &Settings,
     stores: &[&dyn Store],
 ) -> Result<Credentials> {
+    resolve_with_source(environment, options, settings, stores).map(|(credentials, _)| credentials)
+}
+
+fn resolve_with_source(
+    environment: Option<Credentials>,
+    options: &Connection,
+    settings: &Settings,
+    stores: &[&dyn Store],
+) -> Result<(Credentials, &'static str)> {
     if let Some(credentials) = environment {
-        return Ok(credentials);
+        return Ok((credentials, "environment"));
     }
     let account = account(options, settings)?;
     let mut failure = None;
@@ -194,7 +212,7 @@ fn resolve_credentials(
     for store in stores {
         match store.load(&account) {
             Ok(Some(entry)) => {
-                encoded = Some(entry);
+                encoded = Some((entry, store.kind()));
                 break;
             }
             Ok(None) => {}
@@ -203,7 +221,7 @@ fn resolve_credentials(
             }
         }
     }
-    let encoded = match (encoded, failure) {
+    let (encoded, source) = match (encoded, failure) {
         (Some(encoded), _) => encoded,
         (None, Some(error)) => return Err(error),
         (None, None) => {
@@ -213,10 +231,12 @@ fn resolve_credentials(
             );
         }
     };
-    serde_json::from_str(&encoded).map_err(|_| {
-        Error::new("auth", "Saved credentials could not be read")
-            .hint("Run splunk-cli auth login again for this profile and server")
-    })
+    serde_json::from_str(&encoded)
+        .map(|credentials| (credentials, source))
+        .map_err(|_| {
+            Error::new("auth", "Saved credentials could not be read")
+                .hint("Run splunk-cli auth login again for this profile and server")
+        })
 }
 
 pub fn credentials(options: &Connection, settings: &Settings) -> Result<Credentials> {
@@ -237,7 +257,7 @@ fn require_terminal() -> Result<()> {
 }
 
 fn line(prompt: &str) -> Result<String> {
-    eprint!("{prompt}: ");
+    write!(std::io::stderr().lock(), "{prompt}: ")?;
     std::io::stderr().flush()?;
     let mut value = String::new();
     if std::io::stdin().read_line(&mut value)? == 0 {
@@ -256,14 +276,15 @@ fn validate_secret(secret: String) -> Result<String> {
 }
 
 fn piped_token(reader: impl Read) -> Result<String> {
-    let mut token = String::new();
+    let mut token = Vec::new();
     reader
         .take((MAX_SECRET + 1) as u64)
-        .read_to_string(&mut token)
-        .map_err(|_| Error::usage("Cannot read token from stdin as UTF-8"))?;
+        .read_to_end(&mut token)?;
     if token.len() > MAX_SECRET {
         return Err(Error::usage("Token exceeds 64 KiB"));
     }
+    let token = String::from_utf8(token)
+        .map_err(|_| Error::usage("Cannot read token from stdin as UTF-8"))?;
     validate_secret(token.trim().to_owned())
 }
 
@@ -292,10 +313,10 @@ fn choose_store(
         return Ok(Box::new(KeyringStore));
     };
     if interactive {
-        eprintln!("{}", error.message);
+        crate::output::diagnostic(format_args!("{}", crate::output::terminal(&error.message)));
         if confirm(&format!(
             "Save credentials in plaintext at {} (mode 0600) instead?",
-            file.path.display()
+            crate::output::terminal(&file.path.to_string_lossy())
         ))? {
             return Ok(Box::new(file));
         }
@@ -336,6 +357,7 @@ pub async fn login(cli: &Cli, request: LoginRequest<'_>) -> Result<Value> {
     if username.is_some() && !matches!(method, Some(LoginMethod::Password)) {
         return Err(Error::usage("--username requires --method password"));
     }
+    options.profile = Some(config::profile_name(&options)?);
     // Read existing connection settings before prompting, so a malformed config
     // is never silently replaced. Only a missing URL is filled interactively.
     if !token_stdin && config::configured_url(&options)?.is_none() {
@@ -401,15 +423,20 @@ pub async fn login(cli: &Cli, request: LoginRequest<'_>) -> Result<Value> {
     let result = login_with(&options, settings.clone(), credentials, store.as_ref()).await?;
     // Remove a stale entry from the other store so lookups cannot find it first.
     let account = account(&options, &settings)?;
-    let _ = if store.kind() == "file" {
+    let cleanup = if store.kind() == "file" {
         KeyringStore.delete(&account)
     } else {
         FileStore::for_config(&options)?.delete(&account)
     };
+    if cleanup.is_err() && store.kind() == "file" {
+        crate::output::diagnostic(format_args!(
+            "Warning: the file login was saved, but the previous OS credential could not be removed. An older OS credential may override it when the store becomes available; unlock the store and run auth login again."
+        ));
+    }
     if environment_credentials() && !cli.quiet {
-        eprintln!(
+        crate::output::diagnostic(format_args!(
             "Environment credentials are set and will override this saved login for subsequent commands."
-        );
+        ));
     }
     Ok(result)
 }
@@ -420,19 +447,22 @@ async fn browser_session(
     quiet: bool,
 ) -> Result<String> {
     if !quiet {
-        eprintln!("Opening a private browser window for {}", settings.web_url);
-        eprintln!(
+        crate::output::diagnostic(format_args!(
+            "Opening a private browser window for {}",
+            settings.web_url
+        ));
+        crate::output::diagnostic(format_args!(
             "Complete your normal SSO sign-in there. This CLI never receives your identity-provider password."
-        );
+        ));
     }
     let started = std::time::Instant::now();
     crate::browser::browser_login(settings, browser, |progress| {
         if !quiet {
-            eprintln!(
+            crate::output::diagnostic(format_args!(
                 "[+{:>6.1}s] browser: {}",
                 started.elapsed().as_secs_f64(),
                 progress.message()
-            );
+            ));
         }
     })
     .await
@@ -487,23 +517,24 @@ async fn login_with(
         return Err(error);
     }
     Ok(
-        json!({"authenticated": true, "profile": options.profile, "url": settings.url.as_str(),
+        json!({"authenticated": true, "profile": config::profile_name(options)?, "url": settings.url.as_str(),
         "credential_store": store.kind(), "method": method, "environment_credentials": environment_credentials()}),
     )
 }
 
 pub fn logout(options: &Connection) -> Result<Value> {
+    let mut selected = options.clone();
+    selected.profile = Some(config::profile_name(options)?);
+    let options = &selected;
     let settings = config::resolve(options)?;
     let account = account(options, &settings)?;
-    let from_file = FileStore::for_config(options)?.delete(&account)?;
-    // An unavailable OS credential store only matters if it might hold the entry.
-    let removed = match KeyringStore.delete(&account) {
-        Ok(from_keyring) => from_keyring || from_file,
-        Err(_) if from_file => true,
-        Err(error) => return Err(error),
-    };
+    let removed = remove_from_stores(
+        &account,
+        &[&KeyringStore, &FileStore::for_config(options)?],
+        || Ok(()),
+    )?;
     Ok(
-        json!({"profile": options.profile, "url": settings.url.as_str(), "removed": removed,
+        json!({"profile": config::profile_name(options)?, "url": settings.url.as_str(), "removed": removed,
         "environment_credentials": environment_credentials()}),
     )
 }
@@ -517,6 +548,93 @@ pub fn environment_credentials() -> bool {
     ]
     .iter()
     .any(|name| std::env::var_os(name).is_some_and(|value| !value.is_empty()))
+}
+
+pub fn remove_for_profile(
+    options: &Connection,
+    settings: &Settings,
+    commit: impl FnOnce() -> Result<()>,
+) -> Result<bool> {
+    let account = account(options, settings)?;
+    remove_from_stores(
+        &account,
+        &[&KeyringStore, &FileStore::for_config(options)?],
+        commit,
+    )
+}
+
+fn remove_from_stores(
+    account: &str,
+    stores: &[&dyn Store],
+    commit: impl FnOnce() -> Result<()>,
+) -> Result<bool> {
+    let mut previous = Vec::new();
+    let mut failure = None;
+    for store in stores {
+        match store.load(account) {
+            Ok(Some(secret)) => previous.push((*store, secret)),
+            Ok(None) => {}
+            Err(error) => {
+                failure.get_or_insert(error);
+            }
+        }
+    }
+    // Match logout's file fallback: an inaccessible keyring does not prevent
+    // removing a usable file credential. Without an entry, report the failure.
+    if previous.is_empty()
+        && let Some(error) = failure
+    {
+        return Err(error);
+    }
+    let mut deleted = Vec::new();
+    let change = (|| {
+        for (store, secret) in &previous {
+            if store.delete(account)? {
+                deleted.push((*store, secret));
+            }
+        }
+        commit()
+    })();
+    if let Err(error) = change {
+        let mut restored = true;
+        for (store, secret) in deleted {
+            restored &= store.save(account, secret).is_ok();
+        }
+        if !restored {
+            return Err(Error::new(
+                "io",
+                "Profile update failed and credentials could not be restored; log in again",
+            ));
+        }
+        return Err(error);
+    }
+    Ok(!deleted.is_empty())
+}
+
+/// Metadata only; a locally available credential is not proof of authentication.
+pub fn status(options: &Connection, settings: &Settings) -> Result<Value> {
+    load_status(options, settings).map(|(_, metadata)| metadata)
+}
+
+pub(crate) fn load_status(
+    options: &Connection,
+    settings: &Settings,
+) -> Result<(Credentials, Value)> {
+    let (credentials, source) = resolve_with_source(
+        Credentials::optional_from_env()?,
+        options,
+        settings,
+        &[&KeyringStore, &FileStore::for_config(options)?],
+    )?;
+    let method = match &credentials {
+        Credentials::Bearer(_) => "token",
+        Credentials::Session(_) => "session",
+        Credentials::Basic(_, _) => "password",
+    };
+    Ok((
+        credentials,
+        json!({"available": true, "source": source, "method": method, "verified": false}),
+    ))
 }
 
 #[cfg(test)]
@@ -617,7 +735,7 @@ mod tests {
         other.url = config::validate_url("https://other.example:8089").unwrap();
         assert!(resolve_credentials(None, &options, &other, &[&store]).is_err());
         let mut other = options.clone();
-        other.profile = "other".into();
+        other.profile = Some("other".into());
         assert!(resolve_credentials(None, &other, &settings, &[&store]).is_err());
         other = options.clone();
         other.config = Some(dir.path().join("other.toml"));
@@ -868,6 +986,44 @@ mod tests {
         assert!(!contents.contains("synthetic-session"));
         assert!(
             matches!(resolve_credentials(None, &options, &settings, &[&MemoryStore::default(), &file]).unwrap(), Credentials::Session(key) if key == "synthetic-session")
+        );
+    }
+
+    #[test]
+    fn profile_removal_cleans_both_stores_and_restores_them_on_failure() {
+        let keyring = MemoryStore::default();
+        let file = MemoryStore::default();
+        keyring.save("account", "keyring-secret").unwrap();
+        file.save("account", "file-secret").unwrap();
+        assert!(
+            remove_from_stores("account", &[&keyring, &file], || Err(Error::new(
+                "io",
+                "cannot save config"
+            )))
+            .is_err()
+        );
+        assert_eq!(
+            keyring.load("account").unwrap().as_deref(),
+            Some("keyring-secret")
+        );
+        assert_eq!(
+            file.load("account").unwrap().as_deref(),
+            Some("file-secret")
+        );
+        assert!(remove_from_stores("account", &[&keyring, &file], || Ok(())).unwrap());
+        assert!(keyring.load("account").unwrap().is_none());
+        assert!(file.load("account").unwrap().is_none());
+        keyring.save("account", "keyring-secret").unwrap();
+        assert!(remove_from_stores("account", &[&keyring, &BrokenStore], || Ok(())).unwrap());
+        assert!(keyring.load("account").unwrap().is_none());
+        file.save("account", "file-secret").unwrap();
+        assert!(remove_from_stores("account", &[&BrokenStore, &file], || Ok(())).unwrap());
+        assert!(file.load("account").unwrap().is_none());
+        assert!(
+            remove_from_stores("account", &[&BrokenStore, &file], || panic!(
+                "must preserve settings when no store can confirm an entry"
+            ))
+            .is_err()
         );
     }
 

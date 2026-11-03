@@ -7,6 +7,16 @@ use std::{io::IsTerminal, path::PathBuf};
     about,
     disable_help_subcommand = true,
     name = "splunk-cli",
+    after_help = "Examples:
+  splunk-cli init --profile work
+  splunk-cli profile use work
+  splunk-cli doctor
+  splunk-cli search 'index=main error | stats count by host' --earliest -1h
+  splunk-cli search --file query.spl
+  splunk-cli jobs watch JOB_ID
+  splunk-cli jobs export JOB_ID --fields _time,host,_raw --output jsonl
+
+Use 'splunk-cli COMMAND --help' for options and 'splunk-cli schema COMMAND' for the machine contract.",
     long_about = "Search and manage Splunk from the terminal.\n\nRun `splunk-cli schema` for the offline clispec contract. Secrets are read from\nSPLUNK_TOKEN, SPLUNK_SESSION_KEY, or SPLUNK_USERNAME / SPLUNK_PASSWORD, or saved\nwith `splunk-cli auth login`."
 )]
 pub struct Cli {
@@ -34,9 +44,9 @@ pub struct Connection {
     #[arg(long, env = "SPLUNK_WEB_URL", global = true)]
     pub web_url: Option<String>,
     /// Named connection profile.
-    #[arg(long, env = "SPLUNK_PROFILE", default_value = "default", global = true)]
-    pub profile: String,
-    /// Path to the TOML configuration file.
+    #[arg(long, env = "SPLUNK_PROFILE", global = true)]
+    pub profile: Option<String>,
+    /// Path to the UTF-8 TOML configuration file.
     #[arg(long, env = "SPLUNK_CONFIG", global = true)]
     pub config: Option<PathBuf>,
     /// Application namespace (defaults to search).
@@ -63,11 +73,16 @@ pub struct Connection {
 pub enum Format {
     Auto,
     Json,
+    #[value(alias = "table")]
     Text,
+    Csv,
+    #[value(alias = "ndjson")]
+    Jsonl,
 }
 impl Format {
     pub fn is_json(self) -> bool {
-        matches!(self, Self::Json) || matches!(self, Self::Auto) && !std::io::stdout().is_terminal()
+        !matches!(self, Self::Text)
+            && (!matches!(self, Self::Auto) || !std::io::stdout().is_terminal())
     }
 }
 
@@ -93,6 +108,17 @@ pub enum Command {
     /// Manage local connection settings; credentials are never stored here.
     #[command(subcommand)]
     Config(Config),
+    /// Set up a connection with hidden terminal credential prompts.
+    Init(Login),
+    /// Check configuration, credentials, TLS, and access with actionable diagnostics.
+    Doctor {
+        /// Inspect local settings and credentials without making network requests.
+        #[arg(long)]
+        offline: bool,
+    },
+    /// List, select, or remove local connection profiles.
+    #[command(subcommand)]
+    Profile(Profiles),
     /// Print the offline clispec v0.3 contract, optionally filtered to a command.
     Schema {
         /// Command path or prefix, for example: schema jobs results.
@@ -122,7 +148,11 @@ pub struct Page {
 #[derive(Debug, Args)]
 pub struct Query {
     /// SPL query. Prefixes bare expressions with search; preserves leading |.
-    pub query: String,
+    #[arg(required_unless_present = "file", conflicts_with = "file")]
+    pub query: Option<String>,
+    /// Read UTF-8 SPL from a file; use - for piped stdin (maximum 1 MiB).
+    #[arg(long)]
+    pub file: Option<PathBuf>,
     /// Earliest search time (Splunk relative or absolute time).
     #[arg(long, default_value = "-24h", allow_hyphen_values = true)]
     pub earliest: String,
@@ -137,8 +167,11 @@ pub struct Query {
 #[derive(Debug, Args)]
 pub struct Search {
     /// SPL query; omitted when continuing an existing job with --cursor.
-    #[arg(required_unless_present = "cursor", conflicts_with = "cursor")]
+    #[arg(required_unless_present_any = ["cursor", "file"], conflicts_with_all = ["cursor", "file"])]
     pub query: Option<String>,
+    /// Read UTF-8 SPL from a file; use - for piped stdin (maximum 1 MiB).
+    #[arg(long, conflicts_with = "cursor")]
+    pub file: Option<PathBuf>,
     /// Continue the existing job using next_cursor from an earlier result page.
     #[arg(long, conflicts_with_all = ["query", "offset", "earliest", "latest", "wait_timeout", "dry_run"])]
     pub cursor: Option<String>,
@@ -176,6 +209,12 @@ pub enum Jobs {
         #[command(flatten)]
         page: Page,
     },
+    /// Export bounded pages from one completed job; never resubmits SPL.
+    Export(Export),
+    /// Wait for an existing job; timeout or Ctrl-C leaves the job running.
+    Wait(Monitor),
+    /// Watch job progress on stderr and return its final state on stdout.
+    Watch(Monitor),
     /// Cancel a search job. Requires --yes unless --dry-run is used.
     Cancel {
         id: String,
@@ -234,25 +273,13 @@ pub enum Server {
 #[derive(Debug, Subcommand)]
 pub enum Auth {
     /// Sign in (token, password, or browser SSO), validate, and save the credentials.
-    Login {
-        /// Authentication method; prompts when omitted.
-        #[arg(long, value_enum)]
-        method: Option<LoginMethod>,
-        /// Username for password authentication (the password is always hidden).
-        #[arg(long, requires = "method")]
-        username: Option<String>,
-        /// Read a token from piped stdin instead of prompting; requires --url or saved URL.
-        #[arg(long, conflicts_with_all = ["method", "username"])]
-        token_stdin: bool,
-        /// Browser for --method browser: chrome, edge, chromium, firefox, or an executable path.
-        #[arg(long, env = "SPLUNK_BROWSER")]
-        browser: Option<std::ffi::OsString>,
-        /// Save credentials in a plaintext file (mode 0600) next to the config instead of the OS credential store.
-        #[arg(long)]
-        insecure_storage: bool,
-    },
+    Login(Login),
     /// Validate credentials and show the authenticated context.
-    Status,
+    Status {
+        /// Check credential availability without validating it against Splunk.
+        #[arg(long)]
+        offline: bool,
+    },
     /// Remove credentials saved for this profile and server; does not revoke remote tokens.
     Logout,
 }
@@ -275,4 +302,70 @@ pub enum Config {
         #[arg(long)]
         dry_run: bool,
     },
+}
+
+#[derive(Debug, Subcommand)]
+pub enum Profiles {
+    /// List saved profiles without contacting Splunk.
+    List,
+    /// Persist the default profile; flags and SPLUNK_PROFILE still take precedence.
+    Use { name: String },
+    /// Remove a profile and its saved credentials for the configured server.
+    Remove {
+        name: String,
+        /// Remove settings only, leaving saved credentials untouched (for headless recovery).
+        #[arg(long)]
+        keep_credentials: bool,
+        #[arg(long)]
+        yes: bool,
+        #[arg(long)]
+        dry_run: bool,
+    },
+}
+
+#[derive(Debug, Args)]
+pub struct Login {
+    /// Authentication method; prompts when omitted.
+    #[arg(long, value_enum)]
+    pub method: Option<LoginMethod>,
+    /// Username for password authentication (the password is always hidden).
+    #[arg(long, requires = "method")]
+    pub username: Option<String>,
+    /// Read a token from piped stdin instead of prompting; requires --url or saved URL.
+    #[arg(long, conflicts_with_all = ["method", "username"])]
+    pub token_stdin: bool,
+    /// Browser for --method browser: chrome, edge, chromium, firefox, or an executable path.
+    #[arg(long, env = "SPLUNK_BROWSER")]
+    pub browser: Option<std::ffi::OsString>,
+    /// Save credentials in a plaintext file (mode 0600) next to the config instead of the OS credential store.
+    #[arg(long)]
+    pub insecure_storage: bool,
+}
+
+#[derive(Debug, Args)]
+pub struct Monitor {
+    pub id: String,
+    /// Maximum wait in seconds; the job survives timeout and Ctrl-C.
+    #[arg(long, default_value_t = 120, value_parser = clap::value_parser!(u64).range(1..=86400))]
+    pub wait_timeout: u64,
+    /// Seconds between status requests.
+    #[arg(long, default_value_t = 2, value_parser = clap::value_parser!(u64).range(1..=60))]
+    pub interval: u64,
+}
+
+#[derive(Debug, Args)]
+pub struct Export {
+    pub id: String,
+    /// Maximum total records to return (also bounded to 32 MiB of record JSON).
+    #[arg(long, default_value_t = 10000, value_parser = clap::value_parser!(u32).range(1..=1000000))]
+    pub max_results: u32,
+    /// Records per API page; never requests an unlimited count.
+    #[arg(long, default_value_t = 1000, value_parser = clap::value_parser!(u32).range(1..=10000))]
+    pub page_size: u32,
+    /// Resume from the next_offset reported by an earlier export.
+    #[arg(long, default_value_t = 0, value_parser = clap::value_parser!(u64).range(0..=i64::MAX as u64))]
+    pub offset: u64,
+    /// Comma-separated exact output keys, in export column order.
+    #[arg(long, value_delimiter = ',')]
+    pub fields: Vec<String>,
 }
