@@ -6,6 +6,12 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/).
 
 ## [Unreleased]
 
+## [0.0.2](https://github.com/rvben/splunk-cli/compare/v0.0.1...v0.0.2) - 2026-11-03
+
+### Added
+
+- **auth**: add interactive login with OS credential storage ([3c03442](https://github.com/rvben/splunk-cli/commit/3c03442c1430e39bb94e4c6f9e97113c99a50f34))
+
 ## [0.0.1] - 2026-11-03
 
 ### Added
