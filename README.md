@@ -32,20 +32,42 @@ on port 8000. Splunk Cloud deployments may require REST API access to be enabled
 and your source IP to be allowed by an administrator.
 
 ```sh
-splunk-cli config set --profile work --url https://splunk.example.com:8089
+splunk-cli auth login --profile work
 export SPLUNK_PROFILE=work
-# Supply SPLUNK_TOKEN through your secret manager or environment.
 splunk-cli auth status
 splunk-cli server info
 ```
 
-Authentication accepts exactly one of:
+`auth login` prompts for the management URL (if not already configured), an
+authentication method, and a hidden token or password. Credentials are validated
+against Splunk before saving in macOS Keychain, Windows Credential Manager, or
+Linux Secret Service. The credential store must be available and unlocked;
+there is no plaintext fallback. Connection settings stay in the TOML config.
+
+```sh
+splunk-cli auth login --profile work --url https://splunk.example.com:8089 --method token
+splunk-cli auth login --profile work --method password --username myuser
+splunk-cli auth logout --profile work
+# For automation, read a token from stdin without putting it in shell history:
+secret-manager read splunk/token | splunk-cli auth login --profile work --token-stdin
+```
+
+Saved credentials are scoped to the config file, profile, and management URL.
+Changing the URL requires logging in again. `auth logout` removes only the saved
+credential for that connection; it does not revoke the token on Splunk or clear
+environment variables. Expired or revoked credentials require logging in again.
+To remove a previous server's saved credential after changing URLs, use
+`splunk-cli auth logout --profile work --url https://old-host:8089`.
+Prompts use the terminal and never stdout. Without a terminal, interactive login
+fails immediately; `--token-stdin` requires an existing URL or `--url`.
+
+Environment credentials override saved credentials and accept exactly one of:
 
 - `SPLUNK_TOKEN`: authentication token sent as `Authorization: Bearer …`.
 - `SPLUNK_SESSION_KEY`: existing session key sent as `Authorization: Splunk …`.
 - `SPLUNK_USERNAME` and `SPLUNK_PASSWORD`: HTTP basic authentication.
 
-Secrets are never accepted as command-line flags or stored in profiles.
+Secrets are never accepted as command-line flags or stored in TOML profiles.
 Use a least-privilege Splunk account; access follows that account's permissions.
 TLS certificates are verified by default. `--ca-cert /path/to/ca.pem` adds an
 internal certificate authority; `--insecure` disables verification for the current

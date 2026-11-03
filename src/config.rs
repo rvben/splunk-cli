@@ -25,6 +25,7 @@ pub struct Profile {
     pub ca_cert: Option<PathBuf>,
 }
 
+#[derive(Clone)]
 pub struct Settings {
     pub url: Url,
     pub app: String,
@@ -55,6 +56,16 @@ fn read(options: &Connection) -> Result<ConfigFile> {
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(ConfigFile::default()),
         Err(error) => Err(error.into()),
     }
+}
+
+pub fn configured_url(options: &Connection) -> Result<Option<String>> {
+    validate_segment(&options.profile, "profile")?;
+    let file = read(options)?;
+    Ok(options.url.clone().or_else(|| {
+        file.profiles
+            .get(&options.profile)
+            .and_then(|profile| profile.url.clone())
+    }))
 }
 
 pub fn resolve(options: &Connection) -> Result<Settings> {

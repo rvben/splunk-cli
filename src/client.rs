@@ -10,6 +10,8 @@ use serde_json::{Value, json};
 use std::time::Duration;
 
 /// Deliberately has no Debug implementation, so credentials cannot be logged.
+#[derive(Clone, serde::Serialize, serde::Deserialize)]
+#[serde(tag = "kind", content = "value", rename_all = "snake_case")]
 pub enum Credentials {
     Bearer(String),
     Session(String),
@@ -17,6 +19,10 @@ pub enum Credentials {
 }
 impl Credentials {
     pub fn from_env() -> Result<Self> {
+        Self::optional_from_env()?.ok_or_else(|| Error::new("auth", "No complete credentials configured").hint("Run splunk-cli auth login or set SPLUNK_TOKEN, SPLUNK_SESSION_KEY, or both SPLUNK_USERNAME and SPLUNK_PASSWORD"))
+    }
+
+    pub fn optional_from_env() -> Result<Option<Self>> {
         let get = |name| std::env::var(name).ok().filter(|s| !s.is_empty());
         let token = get("SPLUNK_TOKEN");
         let session = get("SPLUNK_SESSION_KEY");
@@ -30,11 +36,14 @@ impl Credentials {
                 "Set only one authentication method: SPLUNK_TOKEN, SPLUNK_SESSION_KEY, or SPLUNK_USERNAME / SPLUNK_PASSWORD",
             ));
         }
+        if methods == 0 {
+            return Ok(None);
+        }
         match (token, session, user, password) {
-            (Some(token), _, _, _) => Ok(Self::Bearer(token)),
-            (_, Some(session), _, _) => Ok(Self::Session(session)),
-            (_, _, Some(user), Some(password)) => Ok(Self::Basic(user, password)),
-            _ => Err(Error::new("auth", "No complete credentials configured").hint("Set SPLUNK_TOKEN, SPLUNK_SESSION_KEY, or both SPLUNK_USERNAME and SPLUNK_PASSWORD")),
+            (Some(token), _, _, _) => Ok(Some(Self::Bearer(token))),
+            (_, Some(session), _, _) => Ok(Some(Self::Session(session))),
+            (_, _, Some(user), Some(password)) => Ok(Some(Self::Basic(user, password))),
+            _ => Err(Error::new("auth", "Incomplete environment credentials").hint("Set both SPLUNK_USERNAME and SPLUNK_PASSWORD, or unset them to use saved credentials")),
         }
     }
 

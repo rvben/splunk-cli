@@ -55,7 +55,7 @@ fn describe(command: &clap::Command, name: &str) -> Value {
     let collection = command.get_arguments().any(|a| a.get_id() == "limit");
     let effects = match name {
         "search" | "jobs create" | "saved-searches run" => "non_idempotent",
-        "jobs cancel" | "jobs delete" | "config set" => "idempotent",
+        "jobs cancel" | "jobs delete" | "config set" | "auth login" | "auth logout" => "idempotent",
         _ => "read_only",
     };
     let args: Vec<_> = command
@@ -100,6 +100,18 @@ fn describe(command: &clap::Command, name: &str) -> Value {
         "jobs cancel" | "jobs delete" => {
             value["stdout_schema"] = json!({"type": "object", "required": ["job_id", "action", "success", "changed"], "properties": {
                 "job_id": {"type": "string"}, "action": {"enum": ["cancel", "delete"]}, "success": {"type": "boolean"}, "changed": {"type": "boolean"}}});
+        }
+        "auth login" => {
+            value["stdout_schema"] = json!({"type": "object", "required": ["authenticated", "profile", "url", "credential_store", "method", "environment_credentials"], "properties": {
+                "authenticated": {"const": true}, "profile": {"type": "string"}, "url": {"type": "string"},
+                "credential_store": {"const": "keyring"}, "method": {"enum": ["token", "password", "session"]}, "environment_credentials": {"type": "boolean"}}});
+            value["x-interactive"] = json!(
+                "Requires terminal stdin and stderr, unless --token-stdin is supplied. Prompts never appear on stdout."
+            );
+        }
+        "auth logout" => {
+            value["stdout_schema"] = json!({"type": "object", "required": ["profile", "url", "removed", "environment_credentials"], "properties": {
+                "profile": {"type": "string"}, "url": {"type": "string"}, "removed": {"type": "boolean"}, "environment_credentials": {"type": "boolean"}}});
         }
         "auth status" => {
             value["stdout_schema"] = json!({"type": "object", "required": ["authenticated", "context"], "properties": {

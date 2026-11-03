@@ -36,6 +36,35 @@ fn data(out: &Output) -> Value {
     );
     serde_json::from_slice(&out.stdout).expect("JSON stdout")
 }
+
+#[test]
+fn interactive_login_refuses_without_a_terminal_before_reading_config() {
+    let out = command(&["auth", "login"])
+        .env("SPLUNK_URL", "invalid")
+        .output()
+        .unwrap();
+    let failure = error(&out, 2, "usage");
+    assert!(failure["message"].as_str().unwrap().contains("terminal"));
+    assert!(failure["hint"].as_str().unwrap().contains("--token-stdin"));
+}
+
+#[test]
+fn login_contract_declares_local_mutation_and_stdin_alternative() {
+    let schema = data(&command(&["schema", "auth", "login"]).output().unwrap());
+    let login = &schema["commands"][0];
+    assert_eq!(login["effects"], "idempotent");
+    assert!(
+        login["args"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|arg| arg["name"] == "--token-stdin")
+    );
+    let out = command(&["auth", "login", "--method", "token", "--token-stdin"])
+        .output()
+        .unwrap();
+    error(&out, 2, "usage");
+}
 fn error(out: &Output, code: i32, kind: &str) -> Value {
     assert_eq!(
         out.status.code(),

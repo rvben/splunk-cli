@@ -7,7 +7,7 @@ use std::{io::IsTerminal, path::PathBuf};
     about,
     disable_help_subcommand = true,
     name = "splunk-cli",
-    long_about = "Search and manage Splunk from the terminal.\n\nRun `splunk-cli schema` for the offline clispec contract. Secrets are read from\nSPLUNK_TOKEN, SPLUNK_SESSION_KEY, or SPLUNK_USERNAME / SPLUNK_PASSWORD."
+    long_about = "Search and manage Splunk from the terminal.\n\nRun `splunk-cli schema` for the offline clispec contract. Secrets are read from\nSPLUNK_TOKEN, SPLUNK_SESSION_KEY, or SPLUNK_USERNAME / SPLUNK_PASSWORD, or saved\nwith `splunk-cli auth login`."
 )]
 pub struct Cli {
     #[command(flatten)]
@@ -25,7 +25,7 @@ pub struct Cli {
     pub command: Command,
 }
 
-#[derive(Debug, Args)]
+#[derive(Debug, Clone, Args)]
 pub struct Connection {
     /// Splunk management base URL, usually https://host:8089.
     #[arg(long, env = "SPLUNK_URL", global = true)]
@@ -84,7 +84,7 @@ pub enum Command {
     /// Inspect the Splunk server.
     #[command(subcommand)]
     Server(Server),
-    /// Check the current credentials against Splunk.
+    /// Log in, check credentials, or remove saved credentials.
     #[command(subcommand)]
     Auth(Auth),
     /// Manage local connection settings; credentials are never stored here.
@@ -230,8 +230,28 @@ pub enum Server {
 }
 #[derive(Debug, Subcommand)]
 pub enum Auth {
+    /// Prompt for credentials, validate them, and save them in the OS credential store.
+    Login {
+        /// Authentication method; prompts when omitted.
+        #[arg(long, value_enum)]
+        method: Option<LoginMethod>,
+        /// Username for password authentication (the password is always hidden).
+        #[arg(long, requires = "method")]
+        username: Option<String>,
+        /// Read a token from piped stdin instead of prompting; requires --url or saved URL.
+        #[arg(long, conflicts_with_all = ["method", "username"])]
+        token_stdin: bool,
+    },
     /// Validate credentials and show the authenticated context.
     Status,
+    /// Remove credentials saved for this profile and server; does not revoke remote tokens.
+    Logout,
+}
+
+#[derive(Debug, Clone, Copy, ValueEnum)]
+pub enum LoginMethod {
+    Token,
+    Password,
 }
 #[derive(Debug, Subcommand)]
 pub enum Config {

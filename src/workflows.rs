@@ -1,7 +1,7 @@
 use crate::{
-    Error, Result,
+    Error, Result, auth,
     cli::{Auth, Cli, Command, Config, Indexes, Jobs, Page, SavedSearches, Server},
-    client::{Client, Credentials, endpoint},
+    client::{Client, endpoint},
     config, output,
 };
 use reqwest::Method;
@@ -33,7 +33,9 @@ fn query_parameters(query: &str, earliest: &str, latest: &str) -> Result<Vec<(St
 }
 
 fn client(cli: &Cli) -> Result<Client> {
-    Client::new(config::resolve(&cli.connection)?, Credentials::from_env()?)
+    let settings = config::resolve(&cli.connection)?;
+    let credentials = auth::credentials(&cli.connection, &settings)?;
+    Client::new(settings, credentials)
 }
 
 fn plan(
@@ -55,6 +57,12 @@ pub async fn execute(cli: &Cli) -> Result<Value> {
         Command::Config(Config::Path) => Ok(json!({"path": config::path(&cli.connection)?})),
         Command::Config(Config::Show) => config::show(&cli.connection),
         Command::Config(Config::Set { dry_run }) => config::save(&cli.connection, *dry_run),
+        Command::Auth(Auth::Login {
+            method,
+            username,
+            token_stdin,
+        }) => auth::login(cli, *method, username.as_deref(), *token_stdin).await,
+        Command::Auth(Auth::Logout) => auth::logout(&cli.connection),
         Command::Search(search) => {
             if let Some(cursor) = &search.cursor {
                 let (sid, offset) = cursor.rsplit_once(':').ok_or_else(|| {
