@@ -11,4 +11,3 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/).
 ### Added
 
 - add clispec-compliant Splunk CLI and PyPI packaging
-- add clispec-compliant Splunk CLI and PyPI packaging
