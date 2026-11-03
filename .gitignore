@@ -1,0 +1,11 @@
+/target
+/dist
+.DS_Store
+*.swp
+
+.env
+.env.*
+*.pem
+.venv/
+__pycache__/
+.wheel-smoke/
