@@ -11,3 +11,7 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/).
 ### Added
 
 - add clispec-compliant Splunk CLI and PyPI packaging
+
+### Fixed
+
+- **ci**: install the v0.3 scorer from pinned source ([dc3d4ff](https://github.com/rvben/splunk-cli/commit/dc3d4ff2c42a27a0d0f3f4f9280203832805d717))
