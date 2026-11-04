@@ -5,7 +5,7 @@ use std::{
     collections::BTreeMap,
     fs::{self, OpenOptions},
     io::Write,
-    path::PathBuf,
+    path::{Path, PathBuf},
 };
 
 #[derive(Default, Deserialize, Serialize)]
@@ -23,11 +23,14 @@ pub struct Profile {
     pub owner: Option<String>,
     pub timeout: Option<u64>,
     pub ca_cert: Option<PathBuf>,
+    pub web_url: Option<String>,
 }
 
 #[derive(Clone)]
 pub struct Settings {
     pub url: Url,
+    /// Splunk Web URL used for browser sign-in.
+    pub web_url: Url,
     pub app: String,
     pub owner: String,
     pub timeout: u64,
@@ -52,7 +55,7 @@ pub fn path(options: &Connection) -> Result<PathBuf> {
 
 fn read(options: &Connection) -> Result<ConfigFile> {
     match fs::read_to_string(path(options)?) {
-        Ok(contents) => toml::from_str(&contents).map_err(|_| Error::usage("Invalid config file; expected [profiles.NAME] with url, app, owner, timeout, ca_cert (no credentials)")),
+        Ok(contents) => toml::from_str(&contents).map_err(|_| Error::usage("Invalid config file; expected [profiles.NAME] with url, web_url, app, owner, timeout, ca_cert (no credentials)")),
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(ConfigFile::default()),
         Err(error) => Err(error.into()),
     }
@@ -100,8 +103,14 @@ pub fn resolve(options: &Connection) -> Result<Settings> {
     if !(1..=3600).contains(&timeout) {
         return Err(Error::usage("timeout must be between 1 and 3600 seconds"));
     }
+    let url = validate_url(url)?;
+    let web_url = match options.web_url.as_ref().or(profile.web_url.as_ref()) {
+        Some(web_url) => validate_web_url(web_url)?,
+        None => default_web_url(&url),
+    };
     Ok(Settings {
-        url: validate_url(url)?,
+        url,
+        web_url,
         app,
         owner,
         timeout,
@@ -131,6 +140,35 @@ pub fn validate_url(value: &str) -> Result<Url> {
     Ok(url)
 }
 
+/// Splunk Web usually shares the management host but listens on the default HTTPS port.
+fn default_web_url(management: &Url) -> Url {
+    let mut url = management.clone();
+    let _ = url.set_scheme("https");
+    let _ = url.set_port(None);
+    url.set_path("/");
+    url
+}
+
+pub fn validate_web_url(value: &str) -> Result<Url> {
+    let mut url = Url::parse(value).map_err(|_| {
+        Error::usage("Invalid Splunk Web URL; expected https://host/ or https://host/splunk/")
+    })?;
+    if !matches!(url.scheme(), "http" | "https")
+        || url.host_str().is_none()
+        || !url.username().is_empty()
+        || url.password().is_some()
+        || url.query().is_some()
+        || url.fragment().is_some()
+    {
+        return Err(Error::usage(
+            "Splunk Web URL must be HTTP(S) without credentials, query parameters, or fragment",
+        ));
+    }
+    let prefix = url.path().trim_end_matches('/').to_owned();
+    url.set_path(&format!("{prefix}/"));
+    Ok(url)
+}
+
 pub fn validate_segment(value: &str, label: &str) -> Result<()> {
     if value.trim().is_empty()
         || value == "."
@@ -149,7 +187,7 @@ pub fn show(options: &Connection) -> Result<serde_json::Value> {
     let settings = resolve(options)?;
     Ok(
         serde_json::json!({"profile": options.profile, "config": path(options)?,
-        "url": settings.url.as_str(), "app": settings.app, "owner": settings.owner,
+        "url": settings.url.as_str(), "web_url": settings.web_url.as_str(), "app": settings.app, "owner": settings.owner,
         "timeout": settings.timeout, "ca_cert": settings.ca_cert, "insecure": settings.insecure}),
     )
 }
@@ -161,24 +199,14 @@ pub fn save(options: &Connection, dry_run: bool) -> Result<serde_json::Value> {
         return Ok(serde_json::json!({"dry_run": true, "settings": planned}));
     }
     let config_path = path(options)?;
-    let parent = config_path
-        .parent()
-        .filter(|p| !p.as_os_str().is_empty())
-        .unwrap_or(std::path::Path::new("."));
-    fs::create_dir_all(parent)?;
-    let mut lock_name = config_path.as_os_str().to_owned();
-    lock_name.push(".lock");
-    let lock = OpenOptions::new()
-        .create(true)
-        .truncate(false)
-        .read(true)
-        .write(true)
-        .open(PathBuf::from(lock_name))?;
-    lock.lock()?;
+    let _lock = lock(&config_path)?;
     let mut file = read(options)?;
     let profile = file.profiles.entry(options.profile.clone()).or_default();
     if options.url.is_some() {
         profile.url = options.url.clone();
+    }
+    if options.web_url.is_some() {
+        profile.web_url = options.web_url.clone();
     }
     if options.app.is_some() {
         profile.app = options.app.clone();
@@ -194,11 +222,38 @@ pub fn save(options: &Connection, dry_run: bool) -> Result<serde_json::Value> {
     }
     let contents = toml::to_string_pretty(&file)
         .map_err(|_| Error::new("io", "Cannot serialize configuration"))?;
-    let mut temporary = tempfile::NamedTempFile::new_in(parent)?;
-    temporary.write_all(contents.as_bytes())?;
+    write_atomic(&config_path, contents.as_bytes())?;
+    Ok(serde_json::json!({"saved": true, "settings": show(options)?}))
+}
+
+fn parent(path: &Path) -> &Path {
+    path.parent()
+        .filter(|p| !p.as_os_str().is_empty())
+        .unwrap_or(Path::new("."))
+}
+
+/// Serialize writers with a separate stable lock file next to `target`.
+pub fn lock(target: &Path) -> Result<fs::File> {
+    fs::create_dir_all(parent(target))?;
+    let mut lock_name = target.as_os_str().to_owned();
+    lock_name.push(".lock");
+    let lock = OpenOptions::new()
+        .create(true)
+        .truncate(false)
+        .read(true)
+        .write(true)
+        .open(PathBuf::from(lock_name))?;
+    lock.lock()?;
+    Ok(lock)
+}
+
+/// Replace `target` atomically; the temporary file is created with mode 0600 on Unix.
+pub fn write_atomic(target: &Path, contents: &[u8]) -> Result<()> {
+    let mut temporary = tempfile::NamedTempFile::new_in(parent(target))?;
+    temporary.write_all(contents)?;
     temporary.as_file().sync_all()?;
     temporary
-        .persist(config_path)
+        .persist(target)
         .map_err(|e| Error::from(e.error))?;
-    Ok(serde_json::json!({"saved": true, "settings": show(options)?}))
+    Ok(())
 }

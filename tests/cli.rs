@@ -11,6 +11,8 @@ fn command(args: &[&str]) -> Command {
     let mut cmd = Command::new(BIN);
     for variable in [
         "SPLUNK_URL",
+        "SPLUNK_WEB_URL",
+        "SPLUNK_BROWSER",
         "SPLUNK_TOKEN",
         "SPLUNK_SESSION_KEY",
         "SPLUNK_USERNAME",
@@ -275,6 +277,49 @@ fn config_profiles_merge_and_environment_and_flags_override() {
         .unwrap(),
     );
     assert_eq!(std::fs::read_to_string(&config).unwrap(), before);
+}
+
+#[test]
+fn web_url_defaults_to_the_management_host_and_can_be_overridden() {
+    let show = |args: &[&str]| {
+        let mut all = vec!["config", "show"];
+        all.extend_from_slice(args);
+        command(&all).output().unwrap()
+    };
+    let value = data(&show(&["--url", "https://splunk.invalid:8089"]));
+    assert_eq!(value["web_url"], "https://splunk.invalid/");
+    let value = data(&show(&[
+        "--url",
+        "https://splunk.invalid:8089",
+        "--web-url",
+        "https://web.invalid:8000/en-US/",
+    ]));
+    assert_eq!(value["web_url"], "https://web.invalid:8000/en-US/");
+    let out = command(&["config", "show", "--url", "https://splunk.invalid:8089"])
+        .env("SPLUNK_WEB_URL", "not a url")
+        .output()
+        .unwrap();
+    assert!(!out.status.success());
+}
+
+#[test]
+fn browser_login_and_file_storage_are_declared_in_the_contract() {
+    let schema = data(&command(&["schema", "auth", "login"]).output().unwrap());
+    let login = &schema["commands"][0];
+    let args = login["args"].as_array().unwrap();
+    for name in ["--browser", "--insecure-storage"] {
+        assert!(args.iter().any(|arg| arg["name"] == name), "{name}");
+    }
+    assert_eq!(
+        login["stdout_schema"]["properties"]["credential_store"]["enum"],
+        json!(["keyring", "file"])
+    );
+    assert!(
+        login["x-interactive"]
+            .as_str()
+            .unwrap()
+            .contains("--method browser")
+    );
 }
 
 #[test]

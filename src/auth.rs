@@ -1,4 +1,4 @@
-//! Explicit terminal login and credentials scoped to a config file, profile, and server.
+//! Explicit login and credentials scoped to a config file, profile, and server.
 use crate::{
     Error, Result,
     cli::{Cli, Connection, LoginMethod},
@@ -8,11 +8,17 @@ use crate::{
 use reqwest::Method;
 use serde_json::{Value, json};
 use sha2::{Digest, Sha256};
-use std::io::{IsTerminal, Read, Write};
+use std::{
+    collections::BTreeMap,
+    io::{IsTerminal, Read, Write},
+    path::PathBuf,
+};
 
 const MAX_SECRET: usize = 64 * 1024;
 
 trait Store {
+    /// Reported as `credential_store` in login output.
+    fn kind(&self) -> &'static str;
     fn load(&self, account: &str) -> Result<Option<String>>;
     fn save(&self, account: &str, secret: &str) -> Result<()>;
     fn delete(&self, account: &str) -> Result<bool>;
@@ -30,7 +36,7 @@ fn store_error(error: keyring::Error) -> Error {
             Error::new("auth", "Saved OS credential data is malformed")
                 .hint("Remove the affected splunk-cli entry from the OS credential manager and log in again"),
         _ => Error::new("auth", "Cannot access the OS credential store").hint(
-        "Unlock your OS credential store (Linux requires a running Secret Service), or use environment credentials. No plaintext credential fallback is used.",
+        "Unlock your OS credential store (Linux requires a running Secret Service), use environment credentials, or run auth login --insecure-storage to save to a plaintext file (mode 0600).",
         ),
     }
 }
@@ -40,6 +46,10 @@ fn keyring_entry(account: &str) -> Result<keyring::Entry> {
 }
 
 impl Store for KeyringStore {
+    fn kind(&self) -> &'static str {
+        "keyring"
+    }
+
     fn load(&self, account: &str) -> Result<Option<String>> {
         match keyring_entry(account)?.get_password() {
             Ok(secret) => Ok(Some(secret)),
@@ -60,6 +70,82 @@ impl Store for KeyringStore {
             Err(keyring::Error::NoEntry) => Ok(false),
             Err(error) => Err(store_error(error)),
         }
+    }
+}
+
+/// Opt-in plaintext store for systems without an OS credential store. Entries
+/// share the keyring account names, in `credentials.json` next to the config.
+struct FileStore {
+    path: PathBuf,
+}
+
+impl FileStore {
+    fn for_config(options: &Connection) -> Result<Self> {
+        let config = config::path(options)?;
+        Ok(Self {
+            path: config.with_file_name("credentials.json"),
+        })
+    }
+
+    fn read(&self) -> Result<BTreeMap<String, String>> {
+        let contents = match std::fs::read(&self.path) {
+            Ok(contents) => contents,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                return Ok(BTreeMap::new());
+            }
+            Err(error) => return Err(error.into()),
+        };
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            if std::fs::metadata(&self.path)?.permissions().mode() & 0o077 != 0 {
+                return Err(Error::new(
+                    "auth",
+                    "The saved credential file is readable by other users",
+                )
+                .hint(format!(
+                    "Run chmod 600 {}, or delete it and log in again",
+                    self.path.display()
+                )));
+            }
+        }
+        serde_json::from_slice(&contents).map_err(|_| {
+            Error::new("auth", "The saved credential file is malformed")
+                .hint(format!("Delete {} and log in again", self.path.display()))
+        })
+    }
+
+    fn update<T>(&self, change: impl FnOnce(&mut BTreeMap<String, String>) -> T) -> Result<T> {
+        let _lock = config::lock(&self.path)?;
+        let mut entries = self.read()?;
+        let result = change(&mut entries);
+        let contents = serde_json::to_vec_pretty(&entries)
+            .map_err(|_| Error::new("io", "Cannot serialize saved credentials"))?;
+        config::write_atomic(&self.path, &contents)?;
+        Ok(result)
+    }
+}
+
+impl Store for FileStore {
+    fn kind(&self) -> &'static str {
+        "file"
+    }
+
+    fn load(&self, account: &str) -> Result<Option<String>> {
+        Ok(self.read()?.remove(account))
+    }
+
+    fn save(&self, account: &str, secret: &str) -> Result<()> {
+        self.update(|entries| {
+            entries.insert(account.into(), secret.into());
+        })
+    }
+
+    fn delete(&self, account: &str) -> Result<bool> {
+        if !self.path.exists() {
+            return Ok(false);
+        }
+        self.update(|entries| entries.remove(account).is_some())
     }
 }
 
@@ -91,19 +177,42 @@ fn canonical_parent(path: &std::path::Path) -> std::path::PathBuf {
     }
 }
 
+/// Environment credentials win; otherwise the first store holding an entry is
+/// used. A store error is reported only when no other store has the entry.
 fn resolve_credentials(
     environment: Option<Credentials>,
     options: &Connection,
     settings: &Settings,
-    store: &impl Store,
+    stores: &[&dyn Store],
 ) -> Result<Credentials> {
     if let Some(credentials) = environment {
         return Ok(credentials);
     }
-    let encoded = store.load(&account(options, settings)?)?.ok_or_else(|| {
-        Error::new("auth", "No saved credentials for this profile and server")
-            .hint("Run splunk-cli auth login, or set environment credentials")
-    })?;
+    let account = account(options, settings)?;
+    let mut failure = None;
+    let mut encoded = None;
+    for store in stores {
+        match store.load(&account) {
+            Ok(Some(entry)) => {
+                encoded = Some(entry);
+                break;
+            }
+            Ok(None) => {}
+            Err(error) => {
+                failure.get_or_insert(error);
+            }
+        }
+    }
+    let encoded = match (encoded, failure) {
+        (Some(encoded), _) => encoded,
+        (None, Some(error)) => return Err(error),
+        (None, None) => {
+            return Err(
+                Error::new("auth", "No saved credentials for this profile and server")
+                    .hint("Run splunk-cli auth login, or set environment credentials"),
+            );
+        }
+    };
     serde_json::from_str(&encoded).map_err(|_| {
         Error::new("auth", "Saved credentials could not be read")
             .hint("Run splunk-cli auth login again for this profile and server")
@@ -115,7 +224,7 @@ pub fn credentials(options: &Connection, settings: &Settings) -> Result<Credenti
         Credentials::optional_from_env()?,
         options,
         settings,
-        &KeyringStore,
+        &[&KeyringStore, &FileStore::for_config(options)?],
     )
 }
 
@@ -158,44 +267,108 @@ fn piped_token(reader: impl Read) -> Result<String> {
     validate_secret(token.trim().to_owned())
 }
 
-pub async fn login(
-    cli: &Cli,
-    method: Option<LoginMethod>,
-    username: Option<&str>,
-    token_stdin: bool,
-) -> Result<Value> {
+fn confirm(prompt: &str) -> Result<bool> {
+    Ok(matches!(
+        line(&format!("{prompt} [y/N]"))?
+            .to_ascii_lowercase()
+            .as_str(),
+        "y" | "yes"
+    ))
+}
+
+/// Pick the store before any credential is entered, so an unusable OS
+/// credential store fails (or falls back with consent) before sign-in.
+fn choose_store(
+    options: &Connection,
+    settings: &Settings,
+    insecure_storage: bool,
+    interactive: bool,
+) -> Result<Box<dyn Store>> {
+    let file = FileStore::for_config(options)?;
+    if insecure_storage {
+        return Ok(Box::new(file));
+    }
+    let Err(error) = KeyringStore.load(&account(options, settings)?) else {
+        return Ok(Box::new(KeyringStore));
+    };
+    if interactive {
+        eprintln!("{}", error.message);
+        if confirm(&format!(
+            "Save credentials in plaintext at {} (mode 0600) instead?",
+            file.path.display()
+        ))? {
+            return Ok(Box::new(file));
+        }
+    }
+    Err(error)
+}
+
+pub struct LoginRequest<'a> {
+    pub method: Option<LoginMethod>,
+    pub username: Option<&'a str>,
+    pub token_stdin: bool,
+    pub browser: Option<std::ffi::OsString>,
+    pub insecure_storage: bool,
+}
+
+pub async fn login(cli: &Cli, request: LoginRequest<'_>) -> Result<Value> {
+    let LoginRequest {
+        method,
+        username,
+        token_stdin,
+        browser,
+        insecure_storage,
+    } = request;
+    let terminal = std::io::stdin().is_terminal() && std::io::stderr().is_terminal();
+    let mut options = cli.connection.clone();
     if token_stdin {
         if std::io::stdin().is_terminal() {
             return Err(Error::usage(
                 "--token-stdin requires a token piped to stdin",
             ));
         }
-    } else {
+    } else if !(matches!(method, Some(LoginMethod::Browser))
+        && config::configured_url(&options)?.is_some())
+    {
+        // Browser sign-in with a known URL needs no prompts; everything else does.
         require_terminal()?;
     }
     if username.is_some() && !matches!(method, Some(LoginMethod::Password)) {
         return Err(Error::usage("--username requires --method password"));
     }
-    let mut options = cli.connection.clone();
     // Read existing connection settings before prompting, so a malformed config
     // is never silently replaced. Only a missing URL is filled interactively.
     if !token_stdin && config::configured_url(&options)?.is_none() {
         options.url = Some(line("Splunk management URL (usually https://host:8089)")?);
     }
     let settings = config::resolve(&options)?;
+    let method = match (token_stdin, method) {
+        (true, _) => LoginMethod::Token,
+        (false, Some(method)) => method,
+        (false, None) => match line(
+            "Authentication: 1) token [default], 2) username/password, 3) browser (SSO)",
+        )?
+        .as_str()
+        {
+            "" | "1" | "token" => LoginMethod::Token,
+            "2" | "password" => LoginMethod::Password,
+            "3" | "browser" => LoginMethod::Browser,
+            _ => {
+                return Err(Error::usage(
+                    "Choose 1 (token), 2 (username/password), or 3 (browser)",
+                ));
+            }
+        },
+    };
+    let store = choose_store(
+        &options,
+        &settings,
+        insecure_storage,
+        terminal && !token_stdin,
+    )?;
     let credentials = if token_stdin {
         Credentials::Bearer(piped_token(std::io::stdin().lock())?)
     } else {
-        let method = match method {
-            Some(method) => method,
-            None => {
-                match line("Authentication: 1) token [default], 2) username/password")?.as_str() {
-                    "" | "1" | "token" => LoginMethod::Token,
-                    "2" | "password" => LoginMethod::Password,
-                    _ => return Err(Error::usage("Choose 1 (token) or 2 (username/password)")),
-                }
-            }
-        };
         match method {
             LoginMethod::Token => Credentials::Bearer(validate_secret(
                 rpassword::prompt_password("Splunk token (hidden): ")?
@@ -220,9 +393,19 @@ pub async fn login(
                     validate_secret(rpassword::prompt_password("Splunk password (hidden): ")?)?,
                 )
             }
+            LoginMethod::Browser => {
+                Credentials::Session(browser_session(&settings, browser, cli.quiet).await?)
+            }
         }
     };
-    let result = login_with(&options, settings, credentials, &KeyringStore).await?;
+    let result = login_with(&options, settings.clone(), credentials, store.as_ref()).await?;
+    // Remove a stale entry from the other store so lookups cannot find it first.
+    let account = account(&options, &settings)?;
+    let _ = if store.kind() == "file" {
+        KeyringStore.delete(&account)
+    } else {
+        FileStore::for_config(&options)?.delete(&account)
+    };
     if environment_credentials() && !cli.quiet {
         eprintln!(
             "Environment credentials are set and will override this saved login for subsequent commands."
@@ -231,11 +414,35 @@ pub async fn login(
     Ok(result)
 }
 
+async fn browser_session(
+    settings: &Settings,
+    browser: Option<std::ffi::OsString>,
+    quiet: bool,
+) -> Result<String> {
+    if !quiet {
+        eprintln!("Opening a private browser window for {}", settings.web_url);
+        eprintln!(
+            "Complete your normal SSO sign-in there. This CLI never receives your identity-provider password."
+        );
+    }
+    let started = std::time::Instant::now();
+    crate::browser::browser_login(settings, browser, |progress| {
+        if !quiet {
+            eprintln!(
+                "[+{:>6.1}s] browser: {}",
+                started.elapsed().as_secs_f64(),
+                progress.message()
+            );
+        }
+    })
+    .await
+}
+
 async fn login_with(
     options: &Connection,
     settings: Settings,
     credentials: Credentials,
-    store: &impl Store,
+    store: &dyn Store,
 ) -> Result<Value> {
     let method = match &credentials {
         Credentials::Bearer(_) => "token",
@@ -281,20 +488,27 @@ async fn login_with(
     }
     Ok(
         json!({"authenticated": true, "profile": options.profile, "url": settings.url.as_str(),
-        "credential_store": "keyring", "method": method, "environment_credentials": environment_credentials()}),
+        "credential_store": store.kind(), "method": method, "environment_credentials": environment_credentials()}),
     )
 }
 
 pub fn logout(options: &Connection) -> Result<Value> {
     let settings = config::resolve(options)?;
-    let removed = KeyringStore.delete(&account(options, &settings)?)?;
+    let account = account(options, &settings)?;
+    let from_file = FileStore::for_config(options)?.delete(&account)?;
+    // An unavailable OS credential store only matters if it might hold the entry.
+    let removed = match KeyringStore.delete(&account) {
+        Ok(from_keyring) => from_keyring || from_file,
+        Err(_) if from_file => true,
+        Err(error) => return Err(error),
+    };
     Ok(
         json!({"profile": options.profile, "url": settings.url.as_str(), "removed": removed,
         "environment_credentials": environment_credentials()}),
     )
 }
 
-fn environment_credentials() -> bool {
+pub fn environment_credentials() -> bool {
     [
         "SPLUNK_TOKEN",
         "SPLUNK_SESSION_KEY",
@@ -318,6 +532,9 @@ mod tests {
     #[derive(Default)]
     struct MemoryStore(RefCell<BTreeMap<String, String>>);
     impl Store for MemoryStore {
+        fn kind(&self) -> &'static str {
+            "keyring"
+        }
         fn load(&self, account: &str) -> Result<Option<String>> {
             Ok(self.0.borrow().get(account).cloned())
         }
@@ -332,6 +549,9 @@ mod tests {
 
     struct UnwritableStore;
     impl Store for UnwritableStore {
+        fn kind(&self) -> &'static str {
+            "keyring"
+        }
         fn load(&self, _: &str) -> Result<Option<String>> {
             Ok(None)
         }
@@ -391,25 +611,25 @@ mod tests {
         let contents = std::fs::read_to_string(config::path(&options).unwrap()).unwrap();
         assert!(!contents.contains("synthetic-token"));
         assert!(
-            matches!(resolve_credentials(None, &options, &settings, &store).unwrap(), Credentials::Bearer(token) if token == "synthetic-token")
+            matches!(resolve_credentials(None, &options, &settings, &[&store]).unwrap(), Credentials::Bearer(token) if token == "synthetic-token")
         );
         let mut other = settings.clone();
         other.url = config::validate_url("https://other.example:8089").unwrap();
-        assert!(resolve_credentials(None, &options, &other, &store).is_err());
+        assert!(resolve_credentials(None, &options, &other, &[&store]).is_err());
         let mut other = options.clone();
         other.profile = "other".into();
-        assert!(resolve_credentials(None, &other, &settings, &store).is_err());
+        assert!(resolve_credentials(None, &other, &settings, &[&store]).is_err());
         other = options.clone();
         other.config = Some(dir.path().join("other.toml"));
-        assert!(resolve_credentials(None, &other, &settings, &store).is_err());
+        assert!(resolve_credentials(None, &other, &settings, &[&store]).is_err());
         // A supplied environment credential bypasses even a corrupt saved entry.
         store
             .save(&account(&options, &settings).unwrap(), "broken")
             .unwrap();
         assert!(
-            matches!(resolve_credentials(Some(Credentials::Session("env-session".into())), &options, &settings, &store).unwrap(), Credentials::Session(token) if token == "env-session")
+            matches!(resolve_credentials(Some(Credentials::Session("env-session".into())), &options, &settings, &[&store]).unwrap(), Credentials::Session(token) if token == "env-session")
         );
-        assert!(resolve_credentials(None, &options, &settings, &store).is_err());
+        assert!(resolve_credentials(None, &options, &settings, &[&store]).is_err());
         assert!(
             store
                 .delete(&account(&options, &settings).unwrap())
@@ -547,6 +767,108 @@ mod tests {
             .is_err()
         );
         assert!(store.load(&account).unwrap().is_none());
+    }
+
+    struct BrokenStore;
+    impl Store for BrokenStore {
+        fn kind(&self) -> &'static str {
+            "keyring"
+        }
+        fn load(&self, _: &str) -> Result<Option<String>> {
+            Err(store_error(keyring::Error::NoDefaultStore))
+        }
+        fn save(&self, _: &str, _: &str) -> Result<()> {
+            Err(store_error(keyring::Error::NoDefaultStore))
+        }
+        fn delete(&self, _: &str) -> Result<bool> {
+            Err(store_error(keyring::Error::NoDefaultStore))
+        }
+    }
+
+    #[test]
+    fn file_store_is_private_and_isolated_per_account() {
+        let dir = tempfile::tempdir().unwrap();
+        let options = options(dir.path(), "https://splunk.example:8089");
+        let store = FileStore::for_config(&options).unwrap();
+        assert_eq!(store.path, dir.path().join("credentials.json"));
+        assert!(store.load("a").unwrap().is_none());
+        assert!(!store.delete("a").unwrap());
+        store.save("a", "first").unwrap();
+        store.save("b", "second").unwrap();
+        assert_eq!(store.load("a").unwrap().as_deref(), Some("first"));
+        assert!(store.delete("a").unwrap());
+        assert!(store.load("a").unwrap().is_none());
+        assert_eq!(store.load("b").unwrap().as_deref(), Some("second"));
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let mode = std::fs::metadata(&store.path).unwrap().permissions().mode();
+            assert_eq!(mode & 0o777, 0o600);
+            std::fs::set_permissions(&store.path, std::fs::Permissions::from_mode(0o644)).unwrap();
+            let error = store.load("b").err().unwrap();
+            assert_eq!(error.kind, "auth");
+            assert!(!error.envelope().to_string().contains("second"));
+            std::fs::set_permissions(&store.path, std::fs::Permissions::from_mode(0o600)).unwrap();
+        }
+        std::fs::write(&store.path, "not json").unwrap();
+        let error = store.load("b").err().unwrap();
+        assert_eq!(error.kind, "auth");
+    }
+
+    #[test]
+    fn unavailable_keyring_falls_back_to_saved_file_entry() {
+        let dir = tempfile::tempdir().unwrap();
+        let options = options(dir.path(), "https://splunk.example:8089");
+        let settings = config::resolve(&options).unwrap();
+        let file = FileStore::for_config(&options).unwrap();
+        // Without a file entry the keyring failure is what the user needs to see.
+        let error = resolve_credentials(None, &options, &settings, &[&BrokenStore, &file])
+            .err()
+            .unwrap();
+        assert!(error.message.contains("OS credential store"));
+        file.save(
+            &account(&options, &settings).unwrap(),
+            &serde_json::to_string(&Credentials::Session("file-session".into())).unwrap(),
+        )
+        .unwrap();
+        assert!(
+            matches!(resolve_credentials(None, &options, &settings, &[&BrokenStore, &file]).unwrap(), Credentials::Session(key) if key == "file-session")
+        );
+    }
+
+    #[tokio::test]
+    async fn file_login_reports_file_store_and_keeps_secrets_out_of_config() {
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/services/authentication/current-context"))
+            .and(header("authorization", "Splunk synthetic-session"))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .set_body_json(json!({"entry": [{"content": {"username": "test"}}]})),
+            )
+            .expect(1)
+            .mount(&server)
+            .await;
+        let dir = tempfile::tempdir().unwrap();
+        let options = options(dir.path(), &server.uri());
+        let settings = config::resolve(&options).unwrap();
+        let file = FileStore::for_config(&options).unwrap();
+        let result = login_with(
+            &options,
+            settings.clone(),
+            Credentials::Session("synthetic-session".into()),
+            &file,
+        )
+        .await
+        .unwrap();
+        assert_eq!(result["credential_store"], "file");
+        assert_eq!(result["method"], "session");
+        assert!(!result.to_string().contains("synthetic-session"));
+        let contents = std::fs::read_to_string(config::path(&options).unwrap()).unwrap();
+        assert!(!contents.contains("synthetic-session"));
+        assert!(
+            matches!(resolve_credentials(None, &options, &settings, &[&MemoryStore::default(), &file]).unwrap(), Credentials::Session(key) if key == "synthetic-session")
+        );
     }
 
     #[test]

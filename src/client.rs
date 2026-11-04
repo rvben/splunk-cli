@@ -66,6 +66,8 @@ pub struct Client {
     http: reqwest::Client,
     pub settings: Settings,
     credentials: Credentials,
+    /// Set when the credentials were saved by `auth login`, so auth failures say how to recover.
+    relogin_hint: bool,
 }
 
 pub fn endpoint(settings: &Settings, namespaced: bool, segments: &[&str]) -> Result<Url> {
@@ -141,7 +143,13 @@ impl Client {
             http,
             settings,
             credentials,
+            relogin_hint: false,
         })
+    }
+
+    pub fn with_relogin_hint(mut self) -> Self {
+        self.relogin_hint = true;
+        self
     }
 
     pub async fn request(
@@ -205,9 +213,14 @@ impl Client {
             if let Some(delay) = retry_after {
                 details["retry_after"] = json!(delay);
             }
-            return Err(
-                Error::new(kind, message.chars().take(2048).collect::<String>()).details(details),
-            );
+            let mut error =
+                Error::new(kind, message.chars().take(2048).collect::<String>()).details(details);
+            if self.relogin_hint && status.as_u16() == 401 {
+                error = error.hint(
+                    "The saved credentials expired or were revoked; run splunk-cli auth login",
+                );
+            }
+            return Err(error);
         }
         if body.is_empty() {
             return Ok(json!({}));

@@ -104,9 +104,9 @@ fn describe(command: &clap::Command, name: &str) -> Value {
         "auth login" => {
             value["stdout_schema"] = json!({"type": "object", "required": ["authenticated", "profile", "url", "credential_store", "method", "environment_credentials"], "properties": {
                 "authenticated": {"const": true}, "profile": {"type": "string"}, "url": {"type": "string"},
-                "credential_store": {"const": "keyring"}, "method": {"enum": ["token", "password", "session"]}, "environment_credentials": {"type": "boolean"}}});
+                "credential_store": {"enum": ["keyring", "file"]}, "method": {"enum": ["token", "password", "session"]}, "environment_credentials": {"type": "boolean"}}});
             value["x-interactive"] = json!(
-                "Requires terminal stdin and stderr, unless --token-stdin is supplied. Prompts never appear on stdout."
+                "Requires terminal stdin and stderr, unless --token-stdin is supplied or --method browser is used with a configured URL. Prompts never appear on stdout. --method browser opens a private browser window for SSO and waits up to 5 minutes. When the OS credential store is unavailable, a terminal session asks before saving to a plaintext file; --insecure-storage opts in without asking."
             );
         }
         "auth logout" => {

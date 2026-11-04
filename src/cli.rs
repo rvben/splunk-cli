@@ -30,6 +30,9 @@ pub struct Connection {
     /// Splunk management base URL, usually https://host:8089.
     #[arg(long, env = "SPLUNK_URL", global = true)]
     pub url: Option<String>,
+    /// Splunk Web URL for browser sign-in (defaults to https on the management host).
+    #[arg(long, env = "SPLUNK_WEB_URL", global = true)]
+    pub web_url: Option<String>,
     /// Named connection profile.
     #[arg(long, env = "SPLUNK_PROFILE", default_value = "default", global = true)]
     pub profile: String,
@@ -230,7 +233,7 @@ pub enum Server {
 }
 #[derive(Debug, Subcommand)]
 pub enum Auth {
-    /// Prompt for credentials, validate them, and save them in the OS credential store.
+    /// Sign in (token, password, or browser SSO), validate, and save the credentials.
     Login {
         /// Authentication method; prompts when omitted.
         #[arg(long, value_enum)]
@@ -241,6 +244,12 @@ pub enum Auth {
         /// Read a token from piped stdin instead of prompting; requires --url or saved URL.
         #[arg(long, conflicts_with_all = ["method", "username"])]
         token_stdin: bool,
+        /// Browser for --method browser: chrome, edge, chromium, firefox, or an executable path.
+        #[arg(long, env = "SPLUNK_BROWSER")]
+        browser: Option<std::ffi::OsString>,
+        /// Save credentials in a plaintext file (mode 0600) next to the config instead of the OS credential store.
+        #[arg(long)]
+        insecure_storage: bool,
     },
     /// Validate credentials and show the authenticated context.
     Status,
@@ -252,6 +261,8 @@ pub enum Auth {
 pub enum LoginMethod {
     Token,
     Password,
+    /// Sign in with your normal SSO in a private browser window.
+    Browser,
 }
 #[derive(Debug, Subcommand)]
 pub enum Config {

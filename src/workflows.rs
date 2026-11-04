@@ -35,7 +35,12 @@ fn query_parameters(query: &str, earliest: &str, latest: &str) -> Result<Vec<(St
 fn client(cli: &Cli) -> Result<Client> {
     let settings = config::resolve(&cli.connection)?;
     let credentials = auth::credentials(&cli.connection, &settings)?;
-    Client::new(settings, credentials)
+    let client = Client::new(settings, credentials)?;
+    Ok(if auth::environment_credentials() {
+        client
+    } else {
+        client.with_relogin_hint()
+    })
 }
 
 fn plan(
@@ -61,7 +66,21 @@ pub async fn execute(cli: &Cli) -> Result<Value> {
             method,
             username,
             token_stdin,
-        }) => auth::login(cli, *method, username.as_deref(), *token_stdin).await,
+            browser,
+            insecure_storage,
+        }) => {
+            auth::login(
+                cli,
+                auth::LoginRequest {
+                    method: *method,
+                    username: username.as_deref(),
+                    token_stdin: *token_stdin,
+                    browser: browser.clone(),
+                    insecure_storage: *insecure_storage,
+                },
+            )
+            .await
+        }
         Command::Auth(Auth::Logout) => auth::logout(&cli.connection),
         Command::Search(search) => {
             if let Some(cursor) = &search.cursor {

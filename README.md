@@ -41,8 +41,10 @@ splunk-cli server info
 `auth login` prompts for the management URL (if not already configured), an
 authentication method, and a hidden token or password. Credentials are validated
 against Splunk before saving in macOS Keychain, Windows Credential Manager, or
-Linux Secret Service. The credential store must be available and unlocked;
-there is no plaintext fallback. Connection settings stay in the TOML config.
+Linux Secret Service. When no credential store is available (for example on
+WSL), an interactive login asks before saving to `credentials.json` next to the
+config file (mode 0600 on Unix); `--insecure-storage` selects that file without
+asking. Connection settings stay in the TOML config.
 
 ```sh
 splunk-cli auth login --profile work --url https://splunk.example.com:8089 --method token
@@ -73,6 +75,31 @@ TLS certificates are verified by default. `--ca-cert /path/to/ca.pem` adds an
 internal certificate authority; `--insecure` disables verification for the current
 invocation. Sending credentials over plain HTTP to a remote host requires
 explicit `--allow-http` (loopback mock/development servers are exempt). HTTP redirects and automatic request retries are disabled.
+
+### Browser sign-in (SSO)
+
+Deployments that sign in through SAML or another identity provider cannot use
+basic authentication. `auth login --method browser` opens a private browser
+window on Splunk Web, waits up to five minutes for you to complete your normal
+sign-in, and saves the resulting Splunk session for the profile. The CLI never
+sees your identity-provider password.
+
+```sh
+splunk-cli config set --profile work \
+  --url https://splunk.example.com:8089 \
+  --web-url https://splunk.example.com/
+splunk-cli --profile work auth login --method browser
+splunk-cli --profile work search 'index=_internal | head 5'
+```
+
+The Splunk Web URL defaults to HTTPS on the management host without a port; set
+`--web-url` (or `SPLUNK_WEB_URL`, or `web_url` in the profile) when Splunk Web
+lives elsewhere or under a path prefix. Chrome, Edge, Chromium and Firefox are
+detected automatically, including Windows browsers from WSL; `--browser` (or
+`SPLUNK_BROWSER`) selects a browser name or executable path. The browser runs
+with a temporary profile that is deleted afterwards. Sessions expire according
+to the server's session timeout; commands then fail with an `auth` error and a
+hint to log in again.
 
 ## Search
 

@@ -21,17 +21,20 @@ name = "splunk-cli"
 path = "src/main.rs"
 
 [dependencies]
+base64 = "0.23"
 clap = { version = "4", features = ["derive", "env"] }
 clap_complete = "4"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 dirs = "7"
+futures-util = "0.3"
 keyring = "4.2"
 rpassword = "7"
 sha2 = "0.10"
 reqwest = { version = "0.13", default-features = false, features = ["rustls", "json", "query", "form"] }
 tempfile = "3"
-tokio = { version = "1", features = ["macros", "rt-multi-thread", "time"] }
+tokio = { version = "1", features = ["fs", "io-util", "macros", "net", "process", "rt-multi-thread", "time"] }
+tokio-tungstenite = "0.30"
 toml = "1.1"
 
 [dev-dependencies]
