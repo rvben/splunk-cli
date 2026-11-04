@@ -30,6 +30,8 @@ JOBS = []
 TOKENS = []
 SAVED = "splunk-cli-live-" + ROOT.name.rsplit("-", 1)[-1]
 SAVED_CREATED = False
+RESTRICTED_CREATED = False
+RESTRICTED = "splunk_cli_reader"
 PROFILES = ("password", "token", "expires", "other", "remove-test")
 
 
@@ -277,6 +279,14 @@ def check_experience():
     report = cli("doctor")
     assert report["ok"] is True and report["credentials"]["verified"] is True
     assert all(check["status"] in ("ok", "warning") for check in report["checks"])
+    # Deliberately switch stores for the same connection. Selection must be
+    # deterministic even when the previous store is still accessible.
+    cli("auth", "migrate", "--to", "file", "--insecure-storage")
+    assert cli("auth", "status", "--offline")["credentials"]["source"] == "file"
+    assert_authenticated()
+    cli("auth", "migrate", "--to", "keyring")
+    assert cli("auth", "status", "--offline")["credentials"]["source"] == "keyring"
+    assert_authenticated()
     cli("profile", "use", "password")
     args = command(["config", "show"])
     index = args.index("--profile")
@@ -327,6 +337,19 @@ def check_workflows():
     assert all(len(line) <= 80 for line in table.stdout.splitlines())
     print("PASS: bounded multi-page export, resume, CSV/JSONL and terminal tables", flush=True)
 
+    output = ROOT / "stream.csv"
+    stream_args = ("jobs", "export", first["job_id"], "--stream", "--output-file", str(output),
+                   "--record-format", "csv", "--fields", "row,message", "--page-size", "1")
+    assert cli(*stream_args, "--max-results", "1")["exported"] == 1
+    with output.open("a") as partial:
+        partial.write("incomplete tail")
+    assert cli(*stream_args, "--resume")["exported"] == 3
+    assert list(csv.reader(io.StringIO(output.read_text()))) == [["row", "message"], ["1", "splunk-cli-live"], ["2", "splunk-cli-live"], ["3", "splunk-cli-live"]]
+    assert cli("search", "check", "| makeresults | stats count")["valid"] is True
+    assert isinstance(cli("jobs", "logs", first["job_id"])["log"], str)
+    cli("search", "check", "| definitely_not_a_splunk_command", code=(2, 5))
+    print("PASS: durable streaming recovery, parse-only SPL checks and job search logs", flush=True)
+
     source = ROOT / "query.spl"
     source.write_text('| makeresults | eval message="file-live" | table message')
     for args, stdin in [(("--file", str(source)), None), (("--file", "-"), source.read_text())]:
@@ -364,6 +387,27 @@ def check_workflows():
     print("PASS: saved search list/show/dispatch and result retrieval", flush=True)
 
 
+def check_restricted_user():
+    global RESTRICTED_CREATED
+    import secrets
+    password = "Aa1!" + secrets.token_urlsafe(32)
+    SECRETS.extend([password, base64.b64encode((RESTRICTED + ":" + password).encode()).decode()])
+    api("POST", "/services/authentication/users", name=RESTRICTED, password=password, roles="user")
+    RESTRICTED_CREATED = True
+    credentials = {"SPLUNK_USERNAME": RESTRICTED, "SPLUNK_PASSWORD": password}
+    assert cli("auth", "status", env=credentials)["authenticated"] is True
+    result = cli("--owner", RESTRICTED, "search", "| makeresults | eval message=\"reader-live\" | table message", env=credentials)
+    JOBS.append(result["job_id"])
+    assert result["items"] == [{"message": "reader-live"}]
+    assert cli("--owner", RESTRICTED, "search", "check", "| makeresults", env=credentials)["valid"] is True
+    assert isinstance(cli("--owner", RESTRICTED, "jobs", "logs", result["job_id"], env=credentials)["log"], str)
+    # The reader must not be able to read an administrator's private job.
+    private = cli("--owner", "admin", "jobs", "create", "| makeresults")["job_id"]
+    JOBS.append(private)
+    cli("--owner", "admin", "jobs", "show", private, env=credentials, code=(3, 4))
+    print("PASS: restricted user can search/parse/read own logs; administrator job stays private", flush=True)
+
+
 def cleanup():
     failures = []
 
@@ -379,6 +423,8 @@ def cleanup():
         remove(lambda: api("DELETE", "/servicesNS/nobody/search/saved/searches/" + SAVED))
     for token in TOKENS:
         remove(lambda: api("DELETE", "/services/authorization/tokens/admin", id=token))
+    if RESTRICTED_CREATED:
+        remove(lambda: api("DELETE", "/services/authentication/users/" + RESTRICTED))
     for profile in PROFILES:
         remove(lambda: cli("auth", "logout", profile=profile))
         remove(lambda: cli("auth", "status", profile=profile, code=3))
@@ -396,6 +442,7 @@ def main():
         check_auth()
         check_experience()
         check_workflows()
+        check_restricted_user()
     except Exception as original:
         try:
             cleanup()

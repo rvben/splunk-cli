@@ -4,6 +4,10 @@ Run the public CLI against a disposable, digest-pinned Splunk 10.6.1.1 server:
 
 ```sh
 SPLUNK_ACCEPT_LICENSE=yes make test-live
+# Both supported test versions, sequentially:
+SPLUNK_ACCEPT_LICENSE=yes make test-live-matrix
+# Select the second pinned version:
+SPLUNK_ACCEPT_LICENSE=yes SPLUNK_TEST_VERSION=9.4.9 make test-live
 ```
 
 Requires Python 3 and a **native x86_64 Linux Docker daemon**. To use homelab
@@ -49,6 +53,16 @@ Expiration and disabling checks require rejection within 180 seconds, allowing
 for Splunk's server-side delay; they verify successful authentication first.
 
 These checks are deliberately separate from `make check`: they start licensed
-software and need native x86 resources. A trusted homelab CI job can invoke
-the same `make test-live` target. Do not expose a homelab Docker daemon or an
-SSH credential to pull-request code from untrusted contributors.
+software and need native x86 resources. The live workflow runs the full matrix
+on a dedicated 4 GiB/2 CPU Husker VM with its own Docker daemon and repo-scoped
+runner. It runs weekly, by manual dispatch on main, and as a required PyPI
+publication gate. Checkout must be integrated into origin/main; pull requests
+and forks cannot enter this workflow. All external contributors require workflow
+approval. Keep those protections enabled and never approve untrusted code for
+homelab execution. The runner has no access to the host Docker socket.
+
+The suite also verifies migration between Secret Service and file storage,
+parse-only SPL checking, job search logs, interrupted streaming CSV recovery,
+and restricted-user search access with denial of a private administrator job.
+The [compatibility matrix](../../docs/compatibility.md) distinguishes live server
+checks from local browser-protocol and private-CA TLS fixtures.

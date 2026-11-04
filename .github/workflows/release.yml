@@ -14,6 +14,9 @@ concurrency:
   group: release-${{ github.ref }}
   cancel-in-progress: false
 jobs:
+  live:
+    name: Live compatibility gate
+    uses: ./.github/workflows/live.yml
   verify:
     name: Verify release
     runs-on: ubuntu-24.04
@@ -103,7 +106,7 @@ jobs:
           if-no-files-found: error
   publish-pypi:
     name: Publish to PyPI
-    needs: [wheels, sdist]
+    needs: [wheels, sdist, live]
     if: ${{ github.ref_type == 'tag' && inputs.dry_run != true }}
     runs-on: ubuntu-24.04
     steps:

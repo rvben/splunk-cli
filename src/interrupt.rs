@@ -12,6 +12,6 @@ pub async fn signal() {
 pub async fn run<T>(operation: impl std::future::Future<Output = Result<T>>) -> Result<T> {
     tokio::select! {
         result = operation => result,
-        _ = signal() => Err(Error::new("interrupted", "Operation interrupted; an existing Splunk job is still available")),
+        _ = signal() => Err(Error::new("interrupted", "Operation interrupted")),
     }
 }

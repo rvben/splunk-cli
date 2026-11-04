@@ -1,6 +1,5 @@
 //! Command arguments are derived from Clap; effects and output contracts live here.
-use crate::{Error, Result, cli::Cli, error::KINDS};
-use clap::CommandFactory;
+use crate::{Error, Result, error::KINDS};
 use serde_json::{Value, json};
 
 fn argument(arg: &clap::Arg) -> Value {
@@ -16,7 +15,7 @@ fn argument(arg: &clap::Arg) -> Value {
         "limit" | "offset" | "timeout" | "wait_timeout" | "interval" | "max_results" | "page_size"
     ) {
         "integer"
-    } else if matches!(id, "fields" | "command") {
+    } else if matches!(id, "fields" | "command" | "keys") {
         "string[]"
     } else {
         "string"
@@ -64,7 +63,9 @@ fn describe(command: &clap::Command, name: &str) -> Value {
     let effects = match name {
         "search" | "jobs create" | "saved-searches run" => "non_idempotent",
         "jobs cancel" | "jobs delete" | "config set" | "auth login" | "auth logout" | "init"
-        | "profile use" | "profile remove" => "idempotent",
+        | "profile use" | "profile remove" | "profile rename" | "config unset" | "auth migrate" => {
+            "idempotent"
+        }
         _ => "read_only",
     };
     let args: Vec<_> = command
@@ -73,7 +74,7 @@ fn describe(command: &clap::Command, name: &str) -> Value {
         .map(argument)
         .collect();
     let mut value = json!({"name": name, "description": command.get_about().map(ToString::to_string).unwrap_or_default(),
-        "effects": effects, "mutating": effects != "read_only", "stability": "experimental", "args": args,
+        "effects": effects, "mutating": effects != "read_only", "stability": "stable", "args": args,
         "cardinality": if collection { "unbounded" } else { "single" }, "stdout_schema": {"type": "object"}});
     if collection {
         value["pagination"] =
@@ -90,6 +91,27 @@ fn describe(command: &clap::Command, name: &str) -> Value {
         }
     }
     match name {
+        "search check" => {
+            value["stdout_schema"] = json!({"type":"object","required":["valid","parse_only","parsed"],"properties":{"valid":{"const":true},"parse_only":{"const":true},"parsed":{"type":"object"}}});
+        }
+        "jobs logs" => {
+            value["stdout_schema"] = json!({"type":"object","required":["job_id","log"],"properties":{"job_id":{"type":"string"},"log":{"type":"string"}}});
+        }
+        "auth migrate" => {
+            value["stdout_schema"] = json!({"type":"object", "required":["profile","url","credential_store","previous_store","changed","dry_run","environment_credentials"], "properties":{
+                "profile":{"type":"string"},"url":{"type":"string"},"credential_store":{"enum":["keyring","file"]},"previous_store":{"enum":["keyring","file"]},"changed":{"type":"boolean"},"dry_run":{"type":"boolean"},"environment_credentials":{"type":"boolean"}
+            }});
+        }
+        "profile rename" => {
+            value["stdout_schema"] = json!({"type":"object", "required":["profile","new_name","changed"], "properties":{
+                "profile":{"type":"string"},"new_name":{"type":"string"},"changed":{"type":"boolean"},"dry_run":{"type":"boolean"},"credentials_moved":{"type":["integer","null"],"minimum":0},"active_profile":{"type":"string"},"keep_credentials":{"type":"boolean"}
+            }});
+        }
+        "config unset" => {
+            value["stdout_schema"] = json!({"type":"object", "required":["profile","unset","changed","dry_run"], "properties":{
+                "profile":{"type":"string"},"unset":{"type":"array","items":{"type":"string"}},"changed":{"type":"boolean"},"dry_run":{"type":"boolean"}
+            }});
+        }
         "jobs create" | "saved-searches run" => {
             value["stdout_schema"] = json!({"type": "object", "required": ["job_id"], "properties": {"job_id": {"type": "string"}}});
         }
@@ -105,6 +127,8 @@ fn describe(command: &clap::Command, name: &str) -> Value {
                 .push(json!("next_cursor"));
             value["stdout_schema"]["properties"]["next_cursor"] =
                 json!({"type": ["string", "null"]});
+            value["stdout_schema"]["properties"]["fields"] =
+                json!({"type":"array","items":{"type":"string"}});
         }
         "jobs cancel" | "jobs delete" => {
             value["stdout_schema"] = json!({"type": "object", "required": ["job_id", "action", "success", "changed"], "properties": {
@@ -166,7 +190,9 @@ fn describe(command: &clap::Command, name: &str) -> Value {
         }
         _ => {}
     }
-    if command.get_arguments().any(|a| a.get_id() == "dry_run") {
+    if command.get_arguments().any(|a| a.get_id() == "dry_run")
+        && !matches!(name, "auth migrate" | "profile rename" | "config unset")
+    {
         let normal = value["stdout_schema"].clone();
         let preview = if name == "config set" {
             json!({"type": "object", "required": ["dry_run", "settings"], "properties": {"dry_run": {"const": true}, "settings": {"type": "object"}}})
@@ -186,7 +212,7 @@ fn describe(command: &clap::Command, name: &str) -> Value {
     }
     if effects == "non_idempotent" {
         value["x-retry-note"] = json!(
-            "No automatic retries. Splunk does not provide an idempotency key for this workflow. Inspect the existing job before resubmitting; SPL may write data."
+            "No automatic submission retries. Splunk does not provide an idempotency key for dispatch. Inspect the existing job before resubmitting; SPL may write data. Subsequent safe GET requests may retry transient HTTP responses."
         );
     }
     if name == "jobs export" {
@@ -200,7 +226,28 @@ fn describe(command: &clap::Command, name: &str) -> Value {
         value["pagination"] =
             json!({"style": "offset", "limit_arg": "--max-results", "offset_arg": "--offset"});
         value["x-export-note"] = json!(
-            "Reads only the named completed job. Stops at --max-results or 32 MiB of record JSON and returns a continuation. Resume with next_offset or use next_cursor with search --cursor. CSV/JSONL emit records only; pagination metadata is on stderr."
+            "Reads only the named completed job. Buffered mode stops at --max-results or 32 MiB of record JSON. --stream writes page-bounded CSV/JSONL to --output-file, advances a durable checkpoint after each synced page, and returns a summary. --resume verifies the durable prefix and discards only an uncommitted tail. Streaming CSV requires --fields. --max-results bounds each invocation."
+        );
+        let buffered = value["stdout_schema"].clone();
+        let streamed = json!({"type":"object","required":["job_id","streamed","output_file","checkpoint","record_format","exported","written","bytes","has_more","next_offset"],"properties":{
+            "job_id":{"type":"string"},"streamed":{"const":true},"output_file":{"type":"string"},"checkpoint":{"type":"string"},"record_format":{"enum":["csv","jsonl"]},"exported":{"type":"integer","minimum":0},"written":{"type":"integer","minimum":0},"bytes":{"type":"integer","minimum":0},"has_more":{"type":"boolean"},"next_offset":{"type":["integer","null"]}
+        }});
+        value["stdout_schema"] = json!({"oneOf":[buffered,streamed]});
+        value["x-local-effects"] = json!(
+            "With --stream this command creates local output/checkpoint/lock files; --resume may truncate bytes after the durable checkpoint. It never mutates or resubmits the remote job."
+        );
+    }
+    if matches!(name, "auth status" | "doctor") {
+        let credentials = json!({"type":"object","properties":{
+            "available":{"type":"boolean"},"source":{"enum":["environment","keyring","file"]},"method":{"enum":["token","session","password"]},"verified":{"type":"boolean"},"selection":{"enum":["environment","saved","legacy"]},"expires_at":{"type":["integer","null"],"minimum":0},"expiry_status":{"enum":["expired","not_expired","unknown"]},"expiry_source":{"enum":["unverified_token_claim",null]}
+        }});
+        if name == "doctor" {
+            value["stdout_schema"]["properties"]["credentials"] = credentials;
+        } else {
+            value["stdout_schema"]["oneOf"][1]["properties"]["credentials"] = credentials;
+        }
+        value["x-expiry-note"] = json!(
+            "JWT exp is an unverified diagnostic claim, never an authentication decision. Opaque tokens, passwords and sessions have unknown expiry; online checks remain authoritative."
         );
     }
     if name == "schema" {
@@ -219,6 +266,9 @@ fn walk(command: &clap::Command, prefix: &str, commands: &mut Vec<Value>) {
     for child in command.get_subcommands() {
         let name = format!("{prefix}{}", child.get_name());
         if child.has_subcommands() {
+            if child.get_name() == "search" {
+                commands.push(describe(child, &name));
+            }
             walk(child, &format!("{name} "), commands);
         } else {
             commands.push(describe(child, &name));
@@ -227,7 +277,7 @@ fn walk(command: &clap::Command, prefix: &str, commands: &mut Vec<Value>) {
 }
 
 pub fn contract() -> Value {
-    let mut cli = Cli::command();
+    let mut cli = crate::cli::command();
     cli.build();
     let mut commands = Vec::new();
     walk(&cli, "", &mut commands);

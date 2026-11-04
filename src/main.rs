@@ -1,4 +1,4 @@
-use clap::{CommandFactory, Parser, error::ErrorKind};
+use clap::{FromArgMatches, error::ErrorKind};
 use splunk_cli::{
     Error,
     cli::{Cli, Command, Format},
@@ -8,7 +8,10 @@ use std::process::ExitCode;
 
 #[tokio::main]
 async fn main() -> ExitCode {
-    let cli = match Cli::try_parse() {
+    let cli = match splunk_cli::cli::command()
+        .try_get_matches()
+        .and_then(|matches| Cli::from_arg_matches(&matches))
+    {
         Ok(cli) => cli,
         Err(error) => {
             if matches!(
@@ -53,7 +56,7 @@ async fn main() -> ExitCode {
             schema::filtered(&command.join(" ")).and_then(|value| output::write(&value, true))
         }
         Command::Completions { shell } => {
-            let mut command = Cli::command();
+            let mut command = splunk_cli::cli::command();
             let mut bytes = Vec::new();
             clap_complete::generate(*shell, &mut command, "splunk-cli", &mut bytes);
             output::write_bytes(&bytes)

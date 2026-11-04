@@ -67,6 +67,12 @@ pub async fn execute(cli: &Cli) -> Result<Value> {
         Command::Profile(Profiles::Use { name }) => {
             config::change_profile(&cli.connection, name, config::ProfileAction::Use)
         }
+        Command::Profile(Profiles::Rename {
+            name,
+            new_name,
+            keep_credentials,
+            dry_run,
+        }) => config::rename_profile(&cli.connection, name, new_name, *keep_credentials, *dry_run),
         Command::Profile(Profiles::Remove {
             name,
             yes,
@@ -92,6 +98,9 @@ pub async fn execute(cli: &Cli) -> Result<Value> {
         Command::Config(Config::Path) => Ok(json!({"path": config::path(&cli.connection)?})),
         Command::Config(Config::Show) => config::show(&cli.connection),
         Command::Config(Config::Set { dry_run }) => config::save(&cli.connection, *dry_run),
+        Command::Config(Config::Unset { keys, dry_run }) => {
+            config::unset(&cli.connection, keys, *dry_run)
+        }
         Command::Init(login) | Command::Auth(Auth::Login(login)) => {
             auth::login(
                 cli,
@@ -106,24 +115,45 @@ pub async fn execute(cli: &Cli) -> Result<Value> {
             .await
         }
         Command::Doctor { offline } => doctor(cli, *offline).await,
+        Command::Auth(Auth::Migrate {
+            to,
+            insecure_storage,
+            dry_run,
+        }) => auth::migrate(&cli.connection, *to, *insecure_storage, *dry_run),
         Command::Auth(Auth::Logout) => auth::logout(&cli.connection),
         Command::Search(search) => {
-            if let Some(cursor) = &search.cursor {
-                let (sid, offset) = cursor.rsplit_once(':').ok_or_else(|| {
-                    Error::usage("Invalid cursor; use the next_cursor from search results")
-                })?;
-                config::validate_segment(sid, "cursor job ID")?;
-                let offset: u64 = offset
-                    .parse()
-                    .map_err(|_| Error::usage("Invalid cursor offset"))?;
-                if offset > i64::MAX as u64 {
-                    return Err(Error::usage("Cursor offset exceeds supported range"));
+            if let Some(crate::cli::SearchCommand::Check {
+                query,
+                file,
+                dry_run,
+            }) = &search.command
+            {
+                let text = read_query(query.as_deref(), file.as_deref())?;
+                let params = vec![
+                    ("q".into(), text),
+                    ("parse_only".into(), "true".into()),
+                    ("enable_lookups".into(), "false".into()),
+                    ("reload_macros".into(), "false".into()),
+                ];
+                let path = &["search", "v2", "parser"];
+                if *dry_run {
+                    return plan(cli, "POST", true, path, &params);
                 }
+                let parsed = client(cli)?
+                    .request(Method::POST, true, path, &params)
+                    .await?;
+                if !parsed.is_object() {
+                    return Err(Error::invalid_response());
+                }
+                return Ok(json!({"valid":true,"parse_only":true,"parsed":parsed}));
+            }
+            if let Some(cursor) = &search.cursor {
                 let mut page = search.page.clone();
-                page.offset = offset;
-                return results(&client(cli)?, sid, &page, None)
+                let settings = config::resolve(&cli.connection)?;
+                let sid = crate::continuation::decode(&settings, cursor, &mut page)?;
+                return results(&client(cli)?, &sid, &page, None)
                     .await
-                    .map_err(|e| with_job(e, sid));
+                    .map_err(|e| with_job(e, &sid));
             }
             let query = read_query(search.query.as_deref(), search.file.as_deref())?;
             let params = query_parameters(&query, &search.earliest, &search.latest)?;
@@ -156,6 +186,12 @@ pub async fn execute(cli: &Cli) -> Result<Value> {
         }
         Command::Jobs(Jobs::List(page)) => {
             list(&client(cli)?, true, &["search", "jobs"], page).await
+        }
+        Command::Jobs(Jobs::Logs { id }) => {
+            let log = interrupt(client(cli)?.text(true, &["search", "jobs", id, "search.log"]))
+                .await
+                .map_err(|e| with_job(e, id))?;
+            Ok(json!({"job_id":id,"log":log}))
         }
         Command::Jobs(Jobs::Show { id, fields }) => {
             show(&client(cli)?, true, &["search", "jobs", id], fields).await
@@ -406,7 +442,12 @@ async fn wait(client: &Client, sid: &str, interval: Option<u64>, progress: bool)
     }
 }
 
-async fn results(client: &Client, sid: &str, page: &Page, state: Option<Value>) -> Result<Value> {
+pub(crate) async fn results(
+    client: &Client,
+    sid: &str,
+    page: &Page,
+    state: Option<Value>,
+) -> Result<Value> {
     interrupt(results_inner(client, sid, page, state)).await
 }
 
@@ -455,10 +496,18 @@ async fn results_inner(
         return Err(Error::invalid_response());
     }
     let mut result = output::page(items, output::number(&state["resultCount"]), page);
+    result["fields"] = json!(page.fields);
     result["job_id"] = json!(sid);
     result["next_cursor"] = result["next_offset"]
         .as_u64()
-        .map(|offset| json!(format!("{sid}:{offset}")))
+        .map(|offset| {
+            json!(crate::continuation::encode(
+                &client.settings,
+                sid,
+                page,
+                offset
+            ))
+        })
         .unwrap_or(Value::Null);
     Ok(result)
 }
@@ -611,6 +660,9 @@ async fn wait_for(
 }
 
 async fn export_results(client: &Client, options: &crate::cli::Export) -> Result<Value> {
+    if options.stream {
+        return interrupt(crate::export::stream(client, options)).await;
+    }
     interrupt(export_results_inner(client, options)).await
 }
 
@@ -654,7 +706,12 @@ async fn export_results_inner(client: &Client, options: &crate::cli::Export) -> 
             let offset = options.offset + items.len() as u64;
             last["has_more"] = json!(true);
             last["next_offset"] = json!(offset);
-            last["next_cursor"] = json!(format!("{}:{offset}", options.id));
+            last["next_cursor"] = json!(crate::continuation::encode(
+                &client.settings,
+                &options.id,
+                &page,
+                offset
+            ));
             break;
         }
         if last["has_more"] != true || items.len() >= options.max_results as usize {

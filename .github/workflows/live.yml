@@ -1,0 +1,33 @@
+name: Live Splunk compatibility
+on:
+  schedule:
+    - cron: '17 4 * * 1'
+  workflow_dispatch:
+  workflow_call:
+permissions:
+  contents: read
+concurrency:
+  group: splunk-live-husker
+  cancel-in-progress: false
+jobs:
+  live:
+    # Never execute PR or fork code on homelab infrastructure.
+    if: >-
+      github.repository == 'rvben/splunk-cli' &&
+      github.event_name != 'pull_request' &&
+      (github.ref == 'refs/heads/main' || startsWith(github.ref, 'refs/tags/v'))
+    runs-on: [self-hosted, linux, x64, splunk-live]
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+      - name: Require integrated source
+        run: |
+          git fetch origin main
+          git merge-base --is-ancestor HEAD origin/main
+      - name: Run the pinned versions sequentially on the isolated Husker VM
+        env:
+          SPLUNK_ACCEPT_LICENSE: 'yes'
+        run: make test-live-matrix

@@ -15,6 +15,9 @@ pub struct ConfigFile {
     pub active_profile: Option<String>,
     #[serde(default)]
     pub profiles: BTreeMap<String, Profile>,
+    /// Non-secret store selection. Tombstones prevent obsolete credentials from resurfacing.
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub credential_states: BTreeMap<String, crate::auth::SavedState>,
 }
 
 #[derive(Clone, Default, Deserialize, Serialize)]
@@ -59,7 +62,7 @@ pub fn path(options: &Connection) -> Result<PathBuf> {
     Ok(path)
 }
 
-fn read(options: &Connection) -> Result<ConfigFile> {
+pub(crate) fn read(options: &Connection) -> Result<ConfigFile> {
     match fs::read_to_string(path(options)?) {
         Ok(contents) => toml::from_str(&contents).map_err(|_| Error::usage("Invalid config file; expected optional active_profile and [profiles.NAME] with url, web_url, app, owner, timeout, ca_cert (no credentials)")),
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(ConfigFile::default()),
@@ -207,9 +210,24 @@ pub fn save(options: &Connection, dry_run: bool) -> Result<serde_json::Value> {
     if dry_run {
         return Ok(serde_json::json!({"dry_run": true, "settings": planned}));
     }
+    transaction(options, |file, config_path| {
+        apply_settings(options, file)?;
+        persist(file, config_path)
+    })?;
+    Ok(serde_json::json!({"saved": true, "settings": show(options)?}))
+}
+
+pub(crate) fn transaction<T>(
+    options: &Connection,
+    change: impl FnOnce(&mut ConfigFile, &Path) -> Result<T>,
+) -> Result<T> {
     let config_path = write_path(options)?;
     let _lock = lock(&config_path)?;
     let mut file = read(options)?;
+    change(&mut file, &config_path)
+}
+
+pub(crate) fn apply_settings(options: &Connection, file: &mut ConfigFile) -> Result<()> {
     let profile = file.profiles.entry(profile_name(options)?).or_default();
     if options.url.is_some() {
         profile.url = options.url.clone();
@@ -230,14 +248,58 @@ pub fn save(options: &Connection, dry_run: bool) -> Result<serde_json::Value> {
         profile.ca_cert =
             Some(fs::canonicalize(ca_cert).map_err(|error| ca_error(ca_cert, error))?);
     }
-    persist(&file, &config_path)?;
-    Ok(serde_json::json!({"saved": true, "settings": show(options)?}))
+    Ok(())
 }
 
-fn persist(file: &ConfigFile, config_path: &std::path::Path) -> Result<()> {
+pub(crate) fn persist(file: &ConfigFile, config_path: &std::path::Path) -> Result<()> {
     let contents = toml::to_string_pretty(file)
         .map_err(|_| Error::new("io", "Cannot serialize configuration"))?;
     write_atomic(config_path, contents.as_bytes())
+}
+
+pub fn unset(
+    options: &Connection,
+    keys: &[crate::cli::SettingKey],
+    dry_run: bool,
+) -> Result<serde_json::Value> {
+    use crate::cli::SettingKey;
+    let name = profile_name(options)?;
+    let update = |file: &mut ConfigFile, path: &Path| {
+        let mut changed = false;
+        let mut names = Vec::new();
+        for key in keys {
+            let label = match key {
+                SettingKey::Url => "url",
+                SettingKey::WebUrl => "web-url",
+                SettingKey::App => "app",
+                SettingKey::Owner => "owner",
+                SettingKey::Timeout => "timeout",
+                SettingKey::CaCert => "ca-cert",
+            };
+            names.push(label);
+            if let Some(profile) = file.profiles.get_mut(&name) {
+                changed |= match key {
+                    SettingKey::Url => profile.url.take().is_some(),
+                    SettingKey::WebUrl => profile.web_url.take().is_some(),
+                    SettingKey::App => profile.app.take().is_some(),
+                    SettingKey::Owner => profile.owner.take().is_some(),
+                    SettingKey::Timeout => profile.timeout.take().is_some(),
+                    SettingKey::CaCert => profile.ca_cert.take().is_some(),
+                };
+            }
+        }
+        if changed && !dry_run {
+            persist(file, path)?;
+        }
+        Ok(
+            serde_json::json!({"profile": name, "unset": names, "changed": changed, "dry_run": dry_run}),
+        )
+    };
+    if dry_run {
+        update(&mut read(options)?, &path(options)?)
+    } else {
+        transaction(options, update)
+    }
 }
 
 pub fn profile_name(options: &Connection) -> Result<String> {
@@ -278,6 +340,53 @@ pub enum ProfileAction {
         dry_run: bool,
         keep_credentials: bool,
     },
+}
+
+pub fn rename_profile(
+    options: &Connection,
+    name: &str,
+    new_name: &str,
+    keep_credentials: bool,
+    dry_run: bool,
+) -> Result<serde_json::Value> {
+    validate_segment(name, "profile")?;
+    validate_segment(new_name, "profile")?;
+    let change = |file: &mut ConfigFile, path: &Path| {
+        let profile = stored_profile(file, name)?.clone();
+        if name != new_name && file.profiles.contains_key(new_name) {
+            return Err(
+                Error::new("conflict", "The destination profile already exists")
+                    .hint("Choose an unused profile name"),
+            );
+        }
+        if dry_run || name == new_name {
+            return Ok(
+                serde_json::json!({"dry_run": dry_run, "changed": name != new_name, "profile": name, "new_name": new_name, "keep_credentials": keep_credentials}),
+            );
+        }
+        file.profiles.remove(name);
+        file.profiles.insert(new_name.into(), profile.clone());
+        if file.active_profile.as_deref().unwrap_or("default") == name {
+            file.active_profile = Some(new_name.into());
+        }
+        let moved = crate::auth::rename_saved(
+            options,
+            name,
+            new_name,
+            profile.url.as_deref(),
+            file,
+            keep_credentials,
+            |file| persist(file, path),
+        )?;
+        Ok(
+            serde_json::json!({"changed": true, "profile": name, "new_name": new_name, "credentials_moved": moved, "active_profile": file.active_profile.as_deref().unwrap_or("default")}),
+        )
+    };
+    if dry_run {
+        change(&mut read(options)?, &path(options)?)
+    } else {
+        transaction(options, change)
+    }
 }
 
 pub fn change_profile(
@@ -321,6 +430,7 @@ pub fn change_profile(
             file.active_profile = None;
         }
         let removed = if let Some(settings) = settings {
+            crate::auth::forget(&mut file, &scoped, &settings)?;
             Some(crate::auth::remove_for_profile(&scoped, &settings, || persist(&file, &config_path)).map_err(|mut error| {
                 if error.kind == "auth" { error.hint = Some(format!("{} To remove settings without changing saved credentials, use --keep-credentials.", error.hint.unwrap_or_default())); }
                 error

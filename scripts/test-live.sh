@@ -11,7 +11,11 @@ if [[ $architecture != x86_64 ]]; then
     printf '%s\n' 'Live tests require a native x86_64 Docker daemon; select an x86 homelab Docker context.' >&2
     exit 2
 fi
-image=splunk/splunk@sha256:6d5227ed82bceaa277d79b1b3e97d8bd460ac6cf0f5df6c1cec95559284a796e
+case ${SPLUNK_TEST_VERSION:-10.6.1.1} in
+    10.6.1.1) image=splunk/splunk@sha256:6d5227ed82bceaa277d79b1b3e97d8bd460ac6cf0f5df6c1cec95559284a796e ;;
+    9.4.9) image=splunk/splunk@sha256:203b430ac01d251fd8b4797ae7986a0cdb004fd8807ab54c887d2892642c2695 ;;
+    *) printf '%s\n' 'Unsupported SPLUNK_TEST_VERSION; choose 10.6.1.1 or 9.4.9.' >&2; exit 2 ;;
+esac
 id="splunk-cli-live-$(python3 -c 'import secrets; print(secrets.token_hex(6))')"
 runner="$id-runner"
 server="$id-server"

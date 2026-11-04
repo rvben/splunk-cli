@@ -88,23 +88,31 @@ pub async fn browser_login(
         callback: &mut callback,
         reported: HashSet::new(),
     };
-    match select_browser_backend(preference)? {
-        BrowserBackend::Native(browser) => {
-            native_browser_session(settings, browser, &mut progress).await
+    let operation = async {
+        match select_browser_backend(preference)? {
+            BrowserBackend::Native(browser) => {
+                native_browser_session(settings, browser, &mut progress).await
+            }
+            BrowserBackend::WindowsBridge(browser) => {
+                let key = windows_browser_session(
+                    settings.web_url.as_str(),
+                    browser.as_deref(),
+                    &mut progress,
+                )
+                .await?;
+                progress.report(BrowserProgress::ValidatingSession);
+                validate_session(settings, &key).await?;
+                progress.report(BrowserProgress::SessionValidated);
+                Ok(key)
+            }
         }
-        BrowserBackend::WindowsBridge(browser) => {
-            let key = windows_browser_session(
-                settings.web_url.as_str(),
-                browser.as_deref(),
-                &mut progress,
-            )
-            .await?;
-            progress.report(BrowserProgress::ValidatingSession);
-            validate_session(settings, &key).await?;
-            progress.report(BrowserProgress::SessionValidated);
-            Ok(key)
-        }
-    }
+    };
+    tokio::time::timeout(LOGIN_TIMEOUT, operation)
+        .await
+        .map_err(|_| {
+            Error::new("timeout", "Browser sign-in timed out after five minutes")
+                .hint("Run auth login again to open a fresh private browser")
+        })?
 }
 
 /// Confirm that the management API accepts the session key.
@@ -296,6 +304,9 @@ impl Drop for NativeBrowser {
 
 async fn wait_for_debugger(process: &mut NativeBrowser) -> Result<String> {
     let http = reqwest::Client::builder()
+        // The debugging endpoint is private to this machine. Sending it to a
+        // configured enterprise proxy can leak the browser control channel.
+        .no_proxy()
         .timeout(Duration::from_secs(2))
         .build()
         .map_err(|_| Error::new("transport", "Cannot initialize the HTTP client"))?;
@@ -1489,7 +1500,7 @@ try {
         if (-not $version) { Start-Sleep -Milliseconds 200 }
     }
     if (-not $version.webSocketDebuggerUrl) {
-        throw 'The private browser opened, but its localhost sign-in channel did not become available within 20 seconds. Edge or Chrome may have ignored its isolated debugging options, or an enterprise browser policy may block browser automation. Set --browser to the other Windows browser and retry with --verbose.'
+        throw 'The private browser opened, but its localhost sign-in channel did not become available within 20 seconds. Edge or Chrome may have ignored its isolated debugging options, or an enterprise browser policy may block browser automation. Set --browser to the other Windows browser and retry; progress milestones on stderr identify the failing stage.'
     }
 
     Write-Stage 'browser-channel-ready'

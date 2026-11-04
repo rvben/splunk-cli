@@ -45,9 +45,10 @@ against Splunk before saving in macOS Keychain, Windows Credential Manager, or
 Linux Secret Service. When no credential store is available (for example on
 WSL), an interactive login asks before saving to `credentials.json` next to the
 config file (mode 0600 on Unix); `--insecure-storage` selects that file without
-asking. Connection settings stay in the TOML config. If an old OS credential cannot
-be removed after saving a file login, a warning explains how to prevent it from
-overriding the new login when the OS store becomes available again.
+asking. Connection settings and nonsecret store-selection metadata stay in the
+TOML config. Each successful login pins its chosen store; an obsolete login in
+another store cannot override it. An unavailable selected store produces a
+recovery error instead of silently selecting different credentials.
 Login saves supplied connection settings, including flag/environment overrides.
 
 ```sh
@@ -56,6 +57,10 @@ splunk-cli auth login --profile work --method password --username myuser
 splunk-cli auth logout --profile work
 # For automation, read a token from stdin without putting it in shell history:
 secret-manager read splunk/token | splunk-cli auth login --profile work --token-stdin
+# Move an existing saved login without contacting Splunk:
+splunk-cli auth migrate --profile work --to keyring --dry-run
+splunk-cli auth migrate --profile work --to keyring
+splunk-cli auth migrate --profile work --to file --insecure-storage
 ```
 
 Saved credentials are scoped to the config file, profile, and management URL.
@@ -78,7 +83,11 @@ Use a least-privilege Splunk account; access follows that account's permissions.
 TLS certificates are verified by default. `--ca-cert /path/to/ca.pem` adds an
 internal certificate authority; `--insecure` disables verification for the current
 invocation. Sending credentials over plain HTTP to a remote host requires
-explicit `--allow-http` (loopback mock/development servers are exempt). HTTP redirects and automatic request retries are disabled.
+explicit `--allow-http` (loopback mock/development servers are exempt). HTTP
+redirects are disabled. Safe GET requests retry HTTP 429/502/503/504 at most twice,
+using 250/500 ms backoff or a numeric `Retry-After` of at most two seconds.
+Longer or date-based retry instructions are returned in the error for the caller
+to schedule. Dispatches and other writes are never automatically retried.
 
 ### Browser sign-in (SSO)
 
@@ -105,6 +114,12 @@ with a temporary profile that is deleted afterwards. Sessions expire according
 to the server's session timeout; commands then fail with an `auth` error and a
 hint to log in again.
 
+Ctrl-C returns exit 130; native browser processes and their private profiles are
+cleaned up. The five-minute deadline includes browser protocol requests. The
+localhost debugging channel bypasses HTTP proxies; management API calls use the
+normal `HTTPS_PROXY`, `HTTP_PROXY`, and `NO_PROXY` environment settings. `--ca-cert`
+configures API trust; the browser uses its own certificate trust settings.
+
 ## Search
 
 ```sh
@@ -113,10 +128,12 @@ splunk-cli search '| makeresults | eval message="hello"' --fields message
 splunk-cli search 'index=main' --limit 20 --output json
 splunk-cli search --file investigation.spl --earliest -7d
 cat investigation.spl | splunk-cli search --file -
+splunk-cli search check --file investigation.spl
 
 # Long-running searches: submit once, then inspect and page the same job.
 splunk-cli jobs create 'index=main | stats count by sourcetype' --earliest -7d
 splunk-cli jobs show JOB_ID
+splunk-cli jobs logs JOB_ID
 splunk-cli jobs watch JOB_ID --wait-timeout 600
 splunk-cli jobs wait JOB_ID --quiet
 splunk-cli jobs results JOB_ID --limit 100 --offset 0 --fields sourcetype,count
@@ -138,7 +155,41 @@ or dispatch can repeat those effects. There is no claimed idempotency key;
 inspect the existing job before resubmitting after an ambiguous failure.
 Use `jobs results JOB_ID` to continue paging rather than running `search` again.
 
+`search check` uses the v2 parser with `parse_only=true`, lookup expansion
+disabled, and macro reloading disabled. It checks syntax without submitting a
+job. It does not establish that referenced indexes, macros, permissions, or
+runtime lookups will succeed. `jobs logs` returns `{job_id, log}` with a bounded
+UTF-8 search log and credential redaction.
+
 ## Export completed results
+
+For large exports and interruption recovery, stream directly to a file:
+
+```sh
+splunk-cli jobs export JOB_ID --stream --output-file events.jsonl --max-results 1000000
+splunk-cli jobs export JOB_ID --stream --output-file events.jsonl --max-results 1000000 --resume
+splunk-cli jobs export JOB_ID --stream --output-file events.csv \
+  --record-format csv --fields _time,host,_raw --page-size 500
+```
+
+Streaming holds one bounded API page in memory and has no aggregate 32 MiB cap.
+`--max-results` limits records written **per invocation**; the stdout summary
+reports cumulative `exported`, current `written`, `has_more`, and `next_offset`.
+Repeat with `--resume` until `has_more` is false. Use the same server, namespace,
+job, fields, file, and record format. Page size and per-invocation bound may change.
+CSV requires explicit fields for stable columns and writes its header exactly once.
+
+The checkpoint defaults to `OUTPUT_FILE.checkpoint.json`; `--checkpoint PATH`
+overrides it. Data is synced before atomically advancing the checkpoint. Resume
+verifies the file's SHA-256 prefix and removes only bytes beyond the last durable
+page, covering partial writes and a crash before checkpoint advancement. Edited
+or shortened durable data is rejected. Output and checkpoints use private file
+permissions on Unix; keep both files together, retain the original Splunk job,
+and protect the export as you would its source data. A job that expires or loses
+results cannot be reconstructed by a checkpoint. Existing files are never
+overwritten by a new export. Only one writer may use an output or checkpoint.
+
+For smaller exports, buffered output remains available:
 
 ```sh
 splunk-cli jobs export JOB_ID --fields _time,host,_raw --output jsonl > events.jsonl
@@ -215,8 +266,12 @@ Explicit `--output json|text|csv|jsonl` always wins (`table` aliases `text`,
 ```
 
 Search results additionally include `job_id` and `next_cursor`.
-Pass that cursor to `splunk-cli search --cursor CURSOR` without a query to page
-the same job; this performs only GET requests and never resubmits SPL. Single-record commands return an
+Pass that opaque cursor to `splunk-cli search --cursor CURSOR` without a query to page
+the same job; this performs only GET requests and never resubmits SPL. New
+continuations bind the server and app/owner namespace,
+and carry the original field selection. Omit `--fields` to reuse that selection;
+a conflicting selection or connection is rejected before HTTP. Legacy `SID:OFFSET`
+cursors remain accepted during 0.1.x with a warning. Single-record commands return an
 object directly. `--fields` selects exact output keys, including dotted Splunk
 keys. SPL files/stdin must be UTF-8 and at most 1 MiB. Collection limits default to 100 and allow 1–10000; zero/unlimited is
 rejected. Unknown totals are `null`; a lookahead record determines `has_more`.
@@ -256,7 +311,8 @@ Only `init` and `auth login` prompt for input. Schema, help, version, and comple
 a connection or configuration. The schema is derived from the parser's actual
 arguments, and includes side effects, output shapes, pagination, and error codes.
 The v0.3 specification is a candidate; this repository vendors the version used
-by its conformance tests. The CLI and its output contract are experimental.
+by its conformance tests. The [compatibility policy](docs/compatibility.md)
+defines the 0.1.x command, JSON, error, cursor, and checkpoint guarantees.
 
 ## Profiles
 
@@ -289,6 +345,10 @@ paths supplied through `config set` are saved as absolute paths.
 ```sh
 splunk-cli profile list
 splunk-cli profile use work
+splunk-cli profile rename work production --dry-run
+splunk-cli profile rename work production
+splunk-cli config unset timeout app --dry-run
+splunk-cli config unset timeout app
 splunk-cli profile remove old --dry-run
 splunk-cli profile remove old --yes
 splunk-cli auth status --offline
@@ -313,6 +373,21 @@ authentication, management API access, the selected job namespace, and visible
 indexes using read-only requests. It never submits SPL or tests write permissions.
 Failures use the normal exit code and error envelope, with completed and failed
 checks in `error.details.checks` and an actionable hint.
+
+`profile rename` updates the saved active profile and moves saved credentials
+for the configured URL and known login URLs. It rolls back copied credentials
+if the settings update fails. `--keep-credentials` renames settings only and
+requires a fresh login under the new name. Historical URLs used before 0.1.0
+have no selection metadata and cannot be discovered automatically; log out of
+those URLs under the old name before renaming. `config unset` removes selected
+saved fields; flag and environment overrides still apply. Unsetting a URL does
+not delete its saved credentials.
+
+Offline credential metadata includes `selection`, `expires_at`, `expiry_status`,
+and `expiry_source`. A JWT's `exp` is an **unverified diagnostic claim**, never
+proof of validity. Opaque tokens, passwords, and browser sessions report unknown
+expiry. Online authentication remains authoritative. `auth migrate` always
+moves the saved credential, even when environment credentials override it.
 
 | Variable | Setting |
 |---|---|
