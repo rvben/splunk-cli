@@ -2366,7 +2366,7 @@ dependencies = [
 
 [[package]]
 name = "splunk-cli"
-version = "0.0.2"
+version = "0.0.3"
 dependencies = [
  "base64 0.23.1",
  "clap",

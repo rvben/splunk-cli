@@ -6,12 +6,15 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/).
 
 ## [Unreleased]
 
+## [0.0.3](https://github.com/rvben/splunk-cli/compare/v0.0.2...v0.0.3) - 2026-11-04
+
 ### Added
 
 - Guided `init`, read-only `doctor`, and offline credential diagnostics.
 - Persistent profile selection with `profile list`, `use`, and guarded `remove`.
 - Aligned terminal tables, CSV and JSONL exports, and SPL files or piped stdin.
 - Bounded `jobs wait` / `watch` and multi-page `jobs export` of an existing job.
+- **auth**: add browser SSO login and opt-in file credential store ([0b31305](https://github.com/rvben/splunk-cli/commit/0b313053fc510696b90704c40c6ba825bdec6dff))
 
 ### Fixed
 
