@@ -6,6 +6,8 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/).
 
 ## [Unreleased]
 
+## [0.1.0](https://github.com/rvben/splunk-cli/compare/v0.0.3...v0.1.0) - 2026-11-04
+
 ### Added
 
 - Durable, page-bounded CSV/JSONL file exports with checkpoints, verified resume, and a single CSV header.
