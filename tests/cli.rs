@@ -347,6 +347,43 @@ async fn streaming_jsonl_can_exceed_the_buffered_limit_and_detects_modified_outp
 }
 
 #[tokio::test]
+async fn exports_refuse_finalized_or_canceled_jobs_before_fetching_or_creating_output() {
+    for state in [
+        json!({"isDone":true,"isFinalized":"1","dispatchState":"DONE"}),
+        json!({"isDone":true,"dispatchState":"USER_CANCEL"}),
+        json!({"isDone":true,"dispatchState":"QUIT"}),
+    ] {
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/servicesNS/nobody/search/search/jobs/job-1"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(entries(state)))
+            .mount(&server)
+            .await;
+        let dir = tempfile::tempdir().unwrap();
+        let file = dir.path().join("refused.jsonl");
+        for stream in [false, true] {
+            let mut args = vec!["jobs", "export", "job-1"];
+            if stream {
+                args.extend(["--stream", "--output-file", file.to_str().unwrap()]);
+            }
+            let out = run(&server, &args).await;
+            let failure = error(&out, 5, "api");
+            assert_eq!(failure["details"]["job_id"], "job-1");
+            assert!(!file.exists());
+            assert!(!dir.path().join("refused.jsonl.checkpoint.json").exists());
+        }
+        assert!(
+            server
+                .received_requests()
+                .await
+                .unwrap()
+                .iter()
+                .all(|r| r.url.path().ends_with("/jobs/job-1"))
+        );
+    }
+}
+
+#[tokio::test]
 async fn interrupted_export_initialization_can_resume_with_its_original_offset() {
     use std::sync::{
         Arc,
@@ -395,6 +432,97 @@ async fn interrupted_export_initialization_can_resume_with_its_original_offset()
         std::fs::read_to_string(file).unwrap(),
         "{\"host\":\"b\"}\n{\"host\":\"c\"}\n"
     );
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn interrupted_streaming_resume_reports_its_durable_checkpoint() {
+    let server = MockServer::start().await;
+    completed(&server).await;
+    Mock::given(method("GET"))
+        .and(path(
+            "/servicesNS/nobody/search/search/v2/jobs/job-1/results",
+        ))
+        .respond_with(
+            ResponseTemplate::new(200)
+                .set_body_json(json!({"results":[{"host":"a"},{"host":"b"}]})),
+        )
+        .mount(&server)
+        .await;
+    let dir = tempfile::tempdir().unwrap();
+    let file = dir.path().join("interrupted.jsonl");
+    let args = [
+        "jobs",
+        "export",
+        "job-1",
+        "--stream",
+        "--output-file",
+        file.to_str().unwrap(),
+        "--max-results",
+        "1",
+    ];
+    assert_eq!(data(&run(&server, &args).await)["exported"], 1);
+    Mock::given(method("GET"))
+        .and(path("/servicesNS/nobody/search/search/jobs/job-1"))
+        .respond_with(
+            ResponseTemplate::new(200)
+                .set_body_json(entries(json!({"isDone":true,"resultCount":3})))
+                .set_delay(std::time::Duration::from_secs(30)),
+        )
+        .with_priority(1)
+        .mount(&server)
+        .await;
+    let child = command(&args)
+        .arg("--resume")
+        .env("SPLUNK_URL", server.uri())
+        .env("SPLUNK_TOKEN", "fixture")
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped())
+        .spawn()
+        .unwrap();
+    let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(10);
+    while server
+        .received_requests()
+        .await
+        .unwrap()
+        .iter()
+        .filter(|r| r.url.path().ends_with("/jobs/job-1"))
+        .count()
+        < 2
+        && tokio::time::Instant::now() < deadline
+    {
+        tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+    }
+    Command::new("kill")
+        .args(["-INT", &child.id().to_string()])
+        .status()
+        .unwrap();
+    let pid = child.id();
+    // Drain both pipes while waiting: recovery guidance can exceed a pipe's capacity.
+    let output = tokio::task::spawn_blocking(move || child.wait_with_output().unwrap());
+    let output = match tokio::time::timeout(std::time::Duration::from_secs(10), output).await {
+        Ok(output) => output.unwrap(),
+        Err(_) => {
+            let _ = Command::new("kill")
+                .args(["-KILL", &pid.to_string()])
+                .status();
+            panic!("Streaming export did not stop after SIGINT");
+        }
+    };
+    let failure = error(&output, 130, "interrupted");
+    assert_eq!(failure["details"]["resumable"], true);
+    assert_eq!(
+        failure["details"]["output_file"],
+        file.canonicalize().unwrap().to_str().unwrap()
+    );
+    assert!(
+        failure["details"]["checkpoint"]
+            .as_str()
+            .unwrap()
+            .ends_with(".checkpoint.json")
+    );
+    assert!(failure["hint"].as_str().unwrap().contains("--resume"));
+    assert_eq!(std::fs::read_to_string(file).unwrap(), "{\"host\":\"a\"}\n");
 }
 
 #[test]

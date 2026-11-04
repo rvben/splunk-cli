@@ -383,17 +383,31 @@ async fn list(client: &Client, namespaced: bool, path: &[&str], page: &Page) -> 
 fn truthy(value: &Value) -> bool {
     value == true || value == "1" || value == "true" || value == 1
 }
-fn check_state(state: &Value) -> Result<bool> {
+pub(crate) fn check_state(state: &Value) -> Result<bool> {
     if truthy(&state["isFailed"])
         || truthy(&state["isZombie"])
+        || truthy(&state["isFinalized"])
         || matches!(
             state["dispatchState"].as_str(),
-            Some("FAILED" | "BAD_INPUT_CANCEL" | "INTERNAL_CANCEL" | "USER_CANCEL")
+            Some(
+                "FAILED"
+                    | "BAD_INPUT_CANCEL"
+                    | "INTERNAL_CANCEL"
+                    | "USER_CANCEL"
+                    | "QUIT"
+                    | "CANCELED"
+                    | "CANCELLED"
+            )
         )
     {
-        return Err(Error::new("api", "Splunk search failed or was canceled"));
+        return Err(Error::new(
+            "api",
+            "Splunk search failed, was canceled, or was finalized before completion",
+        ));
     }
-    if state["dispatchState"] == "PAUSED" {
+    if truthy(&state["isPaused"])
+        || matches!(state["dispatchState"].as_str(), Some("PAUSE" | "PAUSED"))
+    {
         return Err(Error::new(
             "conflict",
             "Search job is paused; inspect it before fetching completed results",
@@ -661,7 +675,7 @@ async fn wait_for(
 
 async fn export_results(client: &Client, options: &crate::cli::Export) -> Result<Value> {
     if options.stream {
-        return interrupt(crate::export::stream(client, options)).await;
+        return crate::export::stream(client, options).await;
     }
     interrupt(export_results_inner(client, options)).await
 }

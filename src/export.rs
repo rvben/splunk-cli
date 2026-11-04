@@ -66,8 +66,13 @@ fn exclusive(path: &Path) -> Result<File> {
         .create(true)
         .truncate(false)
         .open(PathBuf::from(name))?;
-    lock.try_lock()
-        .map_err(|_| Error::new("conflict", "Another export holds this output or checkpoint"))?;
+    lock.try_lock().map_err(|error| match error {
+        std::fs::TryLockError::WouldBlock => {
+            Error::new("conflict", "Another export holds this output or checkpoint")
+                .hint("Wait for the existing writer to finish; do not remove its lock file")
+        }
+        std::fs::TryLockError::Error(error) => error.into(),
+    })?;
     Ok(lock)
 }
 
@@ -117,8 +122,11 @@ pub async fn stream(client: &Client, options: &Export) -> Result<Value> {
     }
     regular(&file_path)?;
     regular(&checkpoint_path)?;
-    stream_to(client, options, &file_path, &checkpoint_path).await.map_err(|mut error| {
-        let resumable = checkpoint_path.is_file();
+    crate::interrupt::run(stream_to(client, options, &file_path, &checkpoint_path)).await.map_err(|mut error| {
+        let resumable = checkpoint_path.is_file() && (
+            matches!(error.kind, "interrupted" | "transport" | "timeout" | "rate_limit" | "io") ||
+            (error.kind == "api" && error.details["http_status"].as_u64().is_some_and(|s| s >= 500))
+        );
         error.details["output_file"] = json!(file_path);
         error.details["checkpoint"] = json!(checkpoint_path);
         error.details["resumable"] = json!(resumable);
@@ -152,26 +160,10 @@ async fn stream_to(
         .and_then(|e| e.get("content"))
         .ok_or_else(Error::invalid_response)?
         .clone();
-    if !matches!(content["isDone"], Value::Bool(true))
-        && content["isDone"] != "1"
-        && content["isDone"] != 1
-    {
+    if !crate::workflows::check_state(&content)? {
         return Err(Error::new(
             "conflict",
             "Search is still running; wait with jobs wait before exporting",
-        ));
-    }
-    if matches!(content["isFailed"], Value::Bool(true))
-        || content["isFailed"] == "1"
-        || content["isFailed"] == 1
-        || matches!(
-            content["dispatchState"].as_str(),
-            Some("FAILED" | "CANCELED" | "CANCELLED" | "FINALIZING")
-        )
-    {
-        return Err(Error::new(
-            "api",
-            "Search failed or was canceled; refusing a partial export",
         ));
     }
     let total = output::number(&content["resultCount"]);
@@ -214,7 +206,7 @@ async fn stream_to(
             return Err(Error::new(
                 "conflict",
                 "Export file is shorter than its durable checkpoint",
-            ));
+            ).hint("Restore the original output and checkpoint together; resume cannot reconstruct missing durable bytes"));
         }
         let mut prefix = (&mut file).take(checkpoint.bytes);
         let mut buffer = [0u8; 65536];
@@ -229,6 +221,9 @@ async fn stream_to(
             return Err(Error::new(
                 "conflict",
                 "Export data changed since its checkpoint; refusing to resume",
+            )
+            .hint(
+                "Restore the original output and checkpoint together, or choose a new output file",
             ));
         }
         file.set_len(checkpoint.bytes)?;
