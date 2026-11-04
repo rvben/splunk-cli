@@ -323,6 +323,13 @@ def check_workflows():
         {"row": str(row), "message": "splunk-cli-live"} for row in (1, 2, 3)]
     print("PASS: real SPL search, field projection and reusable pagination cursor", flush=True)
 
+    limited = cli("search", "| makeresults count=3 | head 1 | eval message=\"head-live\" | table message")
+    JOBS.append(limited["job_id"])
+    limited_state = cli("jobs", "show", limited["job_id"])
+    assert limited_state.get("isFinalized") not in (True, 1, "1", "true")
+    assert cli("jobs", "export", limited["job_id"])["items"] == [{"message": "head-live"}]
+    print("PASS: naturally completed head search stays exportable", flush=True)
+
     exported = cli("jobs", "export", first["job_id"], "--page-size", "1", "--max-results", "2", "--fields", "row,message")
     assert exported["items"] == first["items"] and exported["bounded"] is True
     assert exported["next_offset"] == 2

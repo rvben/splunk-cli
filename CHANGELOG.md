@@ -20,7 +20,8 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/).
 
 - Bind new continuations to their server, namespace, and ordered field selection.
 - Retry transient safe-read HTTP responses within a bounded budget; never replay dispatches.
-- Clean up native browser login on Ctrl-C, enforce a full sign-in deadline, and keep browser debugging off HTTP proxies.
+- Clean up browser login on cancellation, including Windows CLI termination, enforce a full sign-in deadline, and keep browser debugging off HTTP proxies.
+- Preserve streaming checkpoint recovery details on interruption and refuse incomplete finalized searches.
 - Preserve logged-out state when stale credentials reappear, while allowing later cleanup.
 
 ## [0.0.3](https://github.com/rvben/splunk-cli/compare/v0.0.2...v0.0.3) - 2026-11-04

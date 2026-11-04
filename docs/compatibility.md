@@ -58,15 +58,16 @@ parse-only checks, logs, bounded and streaming exports, recovery, and cleanup.
 | Private CA TLS | Public CLI: untrusted connection rejected, explicit CA accepted |
 | HTTP proxy with browser login | Localhost debugging bypasses the proxy |
 | Native browser cancellation | Public CLI: exit 130, browser termination, profile removal |
+| Windows browser cancellation | Public CLI: hard termination closes the browser and removes its profile |
 | Chromium CDP, Firefox BiDi, WSL PowerShell | Protocol fixtures; no external identity provider in CI |
 
 Cloud access policies, enterprise identity providers, browser management
-policies, and Windows/WSL browser cleanup need deployment-specific validation.
+policies, and WSL interop cleanup need deployment-specific validation.
 Browser sign-in uses a private profile and validates its session with the API;
 neither a browser cookie nor a token's unverified expiry claim proves API access.
-On WSL, avoid forcibly terminating Windows PowerShell during sign-in; its normal
-cleanup closes the browser and removes its Windows profile. If it is killed,
-close the private browser and remove its temporary profile manually.
+The Windows bridge detects when the CLI stops waiting and cleans up its private
+browser and profile. Avoid forcibly terminating PowerShell itself during sign-in;
+if it is killed, close the private browser and remove its temporary profile manually.
 
 PyPI ships native wheels for Linux x64/ARM64, macOS x64/ARM64, and Windows x64,
 plus an sdist. Builds from source require Rust 1.90+. The native live Splunk suite
