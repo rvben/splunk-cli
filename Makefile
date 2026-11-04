@@ -1,4 +1,4 @@
-.PHONY: build release test test-live lint fmt check conformance clean install release-patch release-minor release-major update-deps
+.PHONY: build release test test-live test-live-matrix lint fmt check conformance clean install release-patch release-minor release-major update-deps
 
 build:
 	cargo build
@@ -12,6 +12,10 @@ test:
 # Opt-in, native x86 Docker daemon; supports homelab contexts / DOCKER_HOST.
 test-live:
 	bash scripts/test-live.sh
+
+test-live-matrix:
+	SPLUNK_TEST_VERSION=10.6.1.1 bash scripts/test-live.sh
+	SPLUNK_TEST_VERSION=9.4.9 bash scripts/test-live.sh
 
 lint:
 	cargo fmt -- --check

@@ -1,6 +1,47 @@
 use clap::{Args, Parser, Subcommand, ValueEnum};
 use std::{io::IsTerminal, path::PathBuf};
 
+/// Use one command tree for parsing, help, completion and the machine contract.
+pub fn command() -> clap::Command {
+    use clap::CommandFactory;
+    fn examples(mut command: clap::Command, prefix: &str) -> clap::Command {
+        let name = format!("{prefix}{}", command.get_name());
+        let suffix = match name.as_str() {
+            "splunk-cli search" | "splunk-cli jobs create" | "splunk-cli search check" => {
+                " 'index=main error | stats count by host'"
+            }
+            "splunk-cli jobs export" => {
+                " JOB_ID --stream --output-file results.jsonl --page-size 1000"
+            }
+            "splunk-cli jobs results" => " JOB_ID --limit 100 --fields _time,host,_raw",
+            "splunk-cli jobs show"
+            | "splunk-cli jobs logs"
+            | "splunk-cli jobs wait"
+            | "splunk-cli jobs watch" => " JOB_ID",
+            "splunk-cli jobs cancel" | "splunk-cli jobs delete" => " JOB_ID --dry-run",
+            "splunk-cli saved-searches show" => " 'Daily errors'",
+            "splunk-cli saved-searches run" => " 'Daily errors' --dry-run",
+            "splunk-cli indexes show" => " main",
+            "splunk-cli auth login" | "splunk-cli init" => " --profile work",
+            "splunk-cli auth migrate" => " --to keyring --dry-run",
+            "splunk-cli config set" => " --profile work --url https://splunk.example.com:8089",
+            "splunk-cli config unset" => " timeout app --dry-run",
+            "splunk-cli profile use" => " work",
+            "splunk-cli profile rename" => " work production --dry-run",
+            "splunk-cli profile remove" => " old --dry-run",
+            "splunk-cli schema" => " jobs results",
+            "splunk-cli completions" => " zsh",
+            _ => "",
+        };
+        if !prefix.is_empty() && (!command.has_subcommands() || name == "splunk-cli search") {
+            command = command.after_help(format!("Examples:\n  {name}{suffix}\n\nUse 'splunk-cli schema {}' for the machine contract.", name.trim_start_matches("splunk-cli ")));
+        }
+        let child_prefix = format!("{name} ");
+        command.mut_subcommands(|child| examples(child, &child_prefix))
+    }
+    examples(Cli::command(), "")
+}
+
 #[derive(Debug, Parser)]
 #[command(
     version,
@@ -165,7 +206,10 @@ pub struct Query {
 }
 
 #[derive(Debug, Args)]
+#[command(subcommand_negates_reqs = true, args_conflicts_with_subcommands = true)]
 pub struct Search {
+    #[command(subcommand)]
+    pub command: Option<SearchCommand>,
     /// SPL query; omitted when continuing an existing job with --cursor.
     #[arg(required_unless_present_any = ["cursor", "file"], conflicts_with_all = ["cursor", "file"])]
     pub query: Option<String>,
@@ -192,7 +236,24 @@ pub struct Search {
 }
 
 #[derive(Debug, Subcommand)]
+pub enum SearchCommand {
+    /// Parse SPL without dispatching a job or expanding lookups and subsearches.
+    Check {
+        #[arg(required_unless_present = "file", conflicts_with = "file")]
+        query: Option<String>,
+        /// Read UTF-8 SPL from a file; - reads piped stdin.
+        #[arg(long)]
+        file: Option<PathBuf>,
+        /// Preview the parse-only request without network access.
+        #[arg(long)]
+        dry_run: bool,
+    },
+}
+
+#[derive(Debug, Subcommand)]
 pub enum Jobs {
+    /// Read a job's bounded search.log for troubleshooting.
+    Logs { id: String },
     /// Submit SPL and immediately return a job ID. Retrying creates another job.
     Create(Query),
     /// List visible search jobs.
@@ -274,6 +335,17 @@ pub enum Server {
 pub enum Auth {
     /// Sign in (token, password, or browser SSO), validate, and save the credentials.
     Login(Login),
+    /// Move the saved credential between stores without changing its identity or contacting Splunk.
+    Migrate {
+        #[arg(long, value_enum)]
+        to: CredentialStore,
+        /// Explicitly allow storing the credential in a plaintext file (mode 0600).
+        #[arg(long)]
+        insecure_storage: bool,
+        /// Preview the migration without changing any files or credentials.
+        #[arg(long)]
+        dry_run: bool,
+    },
     /// Validate credentials and show the authenticated context.
     Status {
         /// Check credential availability without validating it against Splunk.
@@ -282,6 +354,12 @@ pub enum Auth {
     },
     /// Remove credentials saved for this profile and server; does not revoke remote tokens.
     Logout,
+}
+
+#[derive(Debug, Clone, Copy, ValueEnum)]
+pub enum CredentialStore {
+    Keyring,
+    File,
 }
 
 #[derive(Debug, Clone, Copy, ValueEnum)]
@@ -302,6 +380,23 @@ pub enum Config {
         #[arg(long)]
         dry_run: bool,
     },
+    /// Reset saved fields to their defaults; flag/environment overrides still apply.
+    Unset {
+        #[arg(required = true, num_args = 1.., value_enum)]
+        keys: Vec<SettingKey>,
+        #[arg(long)]
+        dry_run: bool,
+    },
+}
+
+#[derive(Debug, Clone, Copy, ValueEnum)]
+pub enum SettingKey {
+    Url,
+    WebUrl,
+    App,
+    Owner,
+    Timeout,
+    CaCert,
 }
 
 #[derive(Debug, Subcommand)]
@@ -310,6 +405,16 @@ pub enum Profiles {
     List,
     /// Persist the default profile; flags and SPLUNK_PROFILE still take precedence.
     Use { name: String },
+    /// Rename a profile and move its saved logins; update the saved active profile too.
+    Rename {
+        name: String,
+        new_name: String,
+        /// Rename settings only; saved logins stay under the old name.
+        #[arg(long)]
+        keep_credentials: bool,
+        #[arg(long)]
+        dry_run: bool,
+    },
     /// Remove a profile and its saved credentials for the configured server.
     Remove {
         name: String,
@@ -368,4 +473,26 @@ pub struct Export {
     /// Comma-separated exact output keys, in export column order.
     #[arg(long, value_delimiter = ',')]
     pub fields: Vec<String>,
+    /// Write pages directly to a file, with a durable resume checkpoint.
+    #[arg(long, requires = "output_file")]
+    pub stream: bool,
+    /// New export file; existing files require --resume.
+    #[arg(long, requires = "stream")]
+    pub output_file: Option<PathBuf>,
+    /// Record format inside --output-file; stdout remains a summary.
+    #[arg(long, value_enum, default_value = "jsonl", requires = "stream")]
+    pub record_format: RecordFormat,
+    /// Checkpoint path (defaults to OUTPUT_FILE.checkpoint.json).
+    #[arg(long, requires = "stream")]
+    pub checkpoint: Option<PathBuf>,
+    /// Resume the checkpoint, verifying and repairing the output's durable prefix.
+    #[arg(long, requires = "stream")]
+    pub resume: bool,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, ValueEnum, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum RecordFormat {
+    Csv,
+    Jsonl,
 }

@@ -16,6 +16,41 @@ use std::{
 
 const MAX_SECRET: usize = 64 * 1024;
 
+/// Only non-secret metadata is stored in TOML. A missing store is a logout tombstone.
+#[derive(Clone, Default, serde::Serialize, serde::Deserialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct SavedState {
+    pub store: Option<String>,
+    pub profile: Option<String>,
+    pub url: Option<String>,
+}
+
+impl SavedState {
+    fn for_connection(
+        options: &Connection,
+        settings: &Settings,
+        store: Option<&str>,
+    ) -> Result<Self> {
+        Ok(Self {
+            store: store.map(str::to_owned),
+            profile: Some(config::profile_name(options)?),
+            url: Some(settings.url.to_string()),
+        })
+    }
+}
+
+pub(crate) fn forget(
+    file: &mut config::ConfigFile,
+    options: &Connection,
+    settings: &Settings,
+) -> Result<()> {
+    file.credential_states.insert(
+        account(options, settings)?,
+        SavedState::for_connection(options, settings, None)?,
+    );
+    Ok(())
+}
+
 trait Store {
     /// Reported as `credential_store` in login output.
     fn kind(&self) -> &'static str;
@@ -207,9 +242,33 @@ fn resolve_with_source(
         return Ok((credentials, "environment"));
     }
     let account = account(options, settings)?;
+    let state = config::read(options)?.credential_states.remove(&account);
+    if state.as_ref().is_some_and(|state| state.store.is_none()) {
+        return Err(
+            Error::new("auth", "No saved credentials for this profile and server")
+                .hint("Run splunk-cli auth login, or set environment credentials"),
+        );
+    }
+    if state
+        .as_ref()
+        .and_then(|state| state.store.as_deref())
+        .is_some_and(|kind| !matches!(kind, "keyring" | "file"))
+    {
+        return Err(
+            Error::new("auth", "The selected credential store is not supported")
+                .hint("Run splunk-cli auth login to select a supported credential store"),
+        );
+    }
     let mut failure = None;
     let mut encoded = None;
     for store in stores {
+        if state
+            .as_ref()
+            .and_then(|state| state.store.as_deref())
+            .is_some_and(|kind| kind != store.kind())
+        {
+            continue;
+        }
         match store.load(&account) {
             Ok(Some(entry)) => {
                 encoded = Some((entry, store.kind()));
@@ -430,7 +489,7 @@ pub async fn login(cli: &Cli, request: LoginRequest<'_>) -> Result<Value> {
     };
     if cleanup.is_err() && store.kind() == "file" {
         crate::output::diagnostic(format_args!(
-            "Warning: the file login was saved, but the previous OS credential could not be removed. An older OS credential may override it when the store becomes available; unlock the store and run auth login again."
+            "Warning: an obsolete OS credential could not be removed. This connection will continue using the selected file login. Unlock the OS store and run auth migrate --to keyring to move it back."
         ));
     }
     if environment_credentials() && !cli.quiet {
@@ -456,15 +515,19 @@ async fn browser_session(
         ));
     }
     let started = std::time::Instant::now();
-    crate::browser::browser_login(settings, browser, |progress| {
-        if !quiet {
-            crate::output::diagnostic(format_args!(
-                "[+{:>6.1}s] browser: {}",
-                started.elapsed().as_secs_f64(),
-                progress.message()
-            ));
-        }
-    })
+    crate::interrupt::run(crate::browser::browser_login(
+        settings,
+        browser,
+        |progress| {
+            if !quiet {
+                crate::output::diagnostic(format_args!(
+                    "[+{:>6.1}s] browser: {}",
+                    started.elapsed().as_secs_f64(),
+                    progress.message()
+                ));
+            }
+        },
+    ))
     .await
 }
 
@@ -498,24 +561,34 @@ async fn login_with(
     // Save only after validation succeeds. A failed keychain write must leave
     // the config unchanged; a failed config write restores the old credential.
     let account = account(options, &settings)?;
-    let previous = store.load(&account)?;
     let encoded = serde_json::to_string(&credentials)
         .map_err(|_| Error::new("auth", "Cannot encode credentials"))?;
-    store.save(&account, &encoded)?;
-    if let Err(error) = config::save(options, false) {
-        let restored = match previous {
-            Some(previous) => store.save(&account, &previous),
-            None => store.delete(&account).map(|_| ()),
-        };
-        if restored.is_err() {
-            return Err(Error::new(
-                "auth",
-                "Could not save connection settings or restore the previous OS credential",
-            )
-            .hint("Check the config file permissions and OS credential store, then log in again"));
+    config::transaction(options, |file, path| {
+        config::apply_settings(options, file)?;
+        let previous = store.load(&account)?;
+        store.save(&account, &encoded)?;
+        file.credential_states.insert(
+            account.clone(),
+            SavedState::for_connection(options, &settings, Some(store.kind()))?,
+        );
+        if let Err(error) = config::persist(file, path) {
+            let restored = match previous {
+                Some(previous) => store.save(&account, &previous),
+                None => store.delete(&account).map(|_| ()),
+            };
+            if restored.is_err() {
+                return Err(Error::new(
+                    "auth",
+                    "Could not save connection settings or restore the previous OS credential",
+                )
+                .hint(
+                    "Check the config file permissions and OS credential store, then log in again",
+                ));
+            }
+            return Err(error);
         }
-        return Err(error);
-    }
+        Ok(())
+    })?;
     Ok(
         json!({"authenticated": true, "profile": config::profile_name(options)?, "url": settings.url.as_str(),
         "credential_store": store.kind(), "method": method, "environment_credentials": environment_credentials()}),
@@ -528,15 +601,114 @@ pub fn logout(options: &Connection) -> Result<Value> {
     let options = &selected;
     let settings = config::resolve(options)?;
     let account = account(options, &settings)?;
-    let removed = remove_from_stores(
-        &account,
-        &[&KeyringStore, &FileStore::for_config(options)?],
-        || Ok(()),
-    )?;
+    let removed = config::transaction(options, |file, path| {
+        if file
+            .credential_states
+            .get(&account)
+            .is_some_and(|state| state.store.is_none())
+        {
+            let mut removed = false;
+            for store in [
+                &KeyringStore as &dyn Store,
+                &FileStore::for_config(options)?,
+            ] {
+                match store.delete(&account) {
+                    Ok(deleted) => removed |= deleted,
+                    Err(_) => crate::output::diagnostic(format_args!(
+                        "Warning: obsolete {} credentials could not be cleared; this connection remains logged out. Retry logout when that store is available.",
+                        store.kind()
+                    )),
+                }
+            }
+            return Ok(removed);
+        }
+        forget(file, options, &settings)?;
+        remove_from_stores(
+            &account,
+            &[&KeyringStore, &FileStore::for_config(options)?],
+            || config::persist(file, path),
+        )
+    })?;
     Ok(
         json!({"profile": config::profile_name(options)?, "url": settings.url.as_str(), "removed": removed,
         "environment_credentials": environment_credentials()}),
     )
+}
+
+pub fn migrate(
+    options: &Connection,
+    to: crate::cli::CredentialStore,
+    insecure_storage: bool,
+    dry_run: bool,
+) -> Result<Value> {
+    use crate::cli::CredentialStore;
+    if matches!(to, CredentialStore::File) && !insecure_storage && !dry_run {
+        return Err(
+            Error::usage("Migration to a plaintext file requires --insecure-storage")
+                .hint("Preview with --dry-run, or use --to keyring for the OS credential store"),
+        );
+    }
+    let mut selected = options.clone();
+    selected.profile = Some(config::profile_name(options)?);
+    let options = &selected;
+    let settings = config::resolve(options)?;
+    let account = account(options, &settings)?;
+    let file = FileStore::for_config(options)?;
+    let stores: [&dyn Store; 2] = [&KeyringStore, &file];
+    let target = stores[if matches!(to, CredentialStore::File) {
+        1
+    } else {
+        0
+    }];
+    let change = |config: &mut config::ConfigFile, path: &std::path::Path| -> Result<Value> {
+        // Deliberately migrate the saved login even when environment credentials override it.
+        let (credentials, source) = resolve_with_source(None, options, &settings, &stores)?;
+        let already_selected =
+            source == target.kind() && config.credential_states.contains_key(&account);
+        let result = json!({"dry_run": dry_run, "changed": !already_selected, "profile": config::profile_name(options)?, "url": settings.url.as_str(), "previous_store": source, "credential_store": target.kind(), "environment_credentials": environment_credentials()});
+        if dry_run || already_selected {
+            return Ok(result);
+        }
+        let encoded = serde_json::to_string(&credentials)
+            .map_err(|_| Error::new("auth", "Cannot encode credentials"))?;
+        let previous = target.load(&account)?;
+        target.save(&account, &encoded)?;
+        config.credential_states.insert(
+            account.clone(),
+            SavedState::for_connection(options, &settings, Some(target.kind()))?,
+        );
+        if let Err(error) = config::persist(config, path) {
+            let restored = match previous {
+                Some(ref secret) => target.save(&account, secret),
+                None => target.delete(&account).map(|_| ()),
+            };
+            return Err(if restored.is_err() {
+                Error::new(
+                    "auth",
+                    "Credential migration failed and the destination could not be restored",
+                )
+                .hint("Log in again after checking config and credential store permissions")
+            } else {
+                error
+            });
+        }
+        if source != target.kind()
+            && stores
+                .iter()
+                .find(|store| store.kind() == source)
+                .is_some_and(|store| store.delete(&account).is_err())
+        {
+            crate::output::diagnostic(format_args!(
+                "Warning: the old credential could not be removed. The selected destination will continue to be used; remove the obsolete entry when that store becomes available."
+            ));
+        }
+        Ok(result)
+    };
+    if dry_run {
+        change(&mut config::read(options)?, &config::path(options)?)
+    } else {
+        config::transaction(options, change)
+    }
 }
 
 pub fn environment_credentials() -> bool {
@@ -548,6 +720,131 @@ pub fn environment_credentials() -> bool {
     ]
     .iter()
     .any(|name| std::env::var_os(name).is_some_and(|value| !value.is_empty()))
+}
+
+pub(crate) fn rename_saved(
+    options: &Connection,
+    from: &str,
+    to: &str,
+    current_url: Option<&str>,
+    file: &mut config::ConfigFile,
+    keep: bool,
+    commit: impl FnOnce(&config::ConfigFile) -> Result<()>,
+) -> Result<Option<usize>> {
+    let credential_file = FileStore::for_config(options)?;
+    let stores: [&dyn Store; 2] = [&KeyringStore, &credential_file];
+    let mut urls = std::collections::BTreeSet::new();
+    if let Some(url) = current_url {
+        urls.insert(url.to_owned());
+    }
+    for state in file.credential_states.values() {
+        if state.profile.as_deref() == Some(from)
+            && let Some(url) = &state.url
+        {
+            urls.insert(url.clone());
+        }
+    }
+    let mut source_options = options.clone();
+    source_options.profile = Some(from.into());
+    let mut target_options = options.clone();
+    target_options.profile = Some(to.into());
+    let mut copied: Vec<(&dyn Store, String)> = Vec::new();
+    let mut obsolete: Vec<(&dyn Store, String)> = Vec::new();
+    let mut visited = std::collections::HashSet::new();
+    let change = (|| {
+        for url in urls {
+            let url = match config::validate_url(&url) {
+                Ok(url) => url,
+                Err(_) if keep => continue,
+                Err(error) => {
+                    return Err(error.hint(
+                        "Use --keep-credentials to rename settings without moving saved logins",
+                    ));
+                }
+            };
+            if !visited.insert(url.to_string()) {
+                continue;
+            }
+            let settings = Settings {
+                web_url: url.clone(),
+                url,
+                app: "search".into(),
+                owner: "nobody".into(),
+                timeout: 30,
+                ca_cert: None,
+                insecure: false,
+                allow_http: false,
+            };
+            let old = account(&source_options, &settings)?;
+            let new = account(&target_options, &settings)?;
+            if keep {
+                forget(file, &target_options, &settings)?;
+                continue;
+            }
+            let logged_out = file
+                .credential_states
+                .get(&old)
+                .is_some_and(|state| state.store.is_none());
+            let login = if logged_out {
+                None
+            } else {
+                match resolve_with_source(None, &source_options, &settings, &stores) {
+                    Ok(login) => Some(login),
+                    Err(error) if error.kind == "auth" && error.message.starts_with("No saved credentials") => None,
+                    Err(error) => return Err(error.hint("Unlock the credential store, or use --keep-credentials to rename settings and log in again under the new name")),
+                }
+            };
+            forget(file, &source_options, &settings)?;
+            if let Some((credentials, source)) = login {
+                let store = *stores
+                    .iter()
+                    .find(|store| store.kind() == source)
+                    .expect("resolved store");
+                if store.load(&new)?.is_some() {
+                    return Err(Error::new("conflict", "Saved credentials already exist under the destination profile name")
+                        .hint("Choose another name, or remove the destination's saved login before renaming"));
+                }
+                let encoded = serde_json::to_string(&credentials)
+                    .map_err(|_| Error::new("auth", "Cannot encode credentials"))?;
+                store.save(&new, &encoded)?;
+                copied.push((store, new.clone()));
+                obsolete.push((store, old));
+                file.credential_states.insert(
+                    new,
+                    SavedState::for_connection(&target_options, &settings, Some(source))?,
+                );
+            } else {
+                forget(file, &target_options, &settings)?;
+            }
+        }
+        commit(file)
+    })();
+    if let Err(error) = change {
+        let mut restored = true;
+        for (store, account) in &copied {
+            restored &= store.delete(account).is_ok();
+        }
+        return Err(if restored {
+            error
+        } else {
+            Error::new("auth", "Profile rename failed and copied credentials could not be removed").hint("The original profile and credentials remain available; remove the unused destination credentials when its store becomes available")
+        });
+    }
+    for (store, account) in obsolete {
+        if store.delete(&account).is_err() {
+            crate::output::diagnostic(format_args!(
+                "Warning: an obsolete credential under the old profile name could not be removed. It will not be selected; remove it when that store is available."
+            ));
+        }
+    }
+    if keep {
+        crate::output::diagnostic(format_args!(
+            "Warning: saved logins were kept under the old name. Run auth login for the renamed profile."
+        ));
+        Ok(None)
+    } else {
+        Ok(Some(copied.len()))
+    }
 }
 
 pub fn remove_for_profile(
@@ -631,9 +928,48 @@ pub(crate) fn load_status(
         Credentials::Session(_) => "session",
         Credentials::Basic(_, _) => "password",
     };
+    let selection = if source == "environment" {
+        "environment"
+    } else if config::read(options)?
+        .credential_states
+        .contains_key(&account(options, settings)?)
+    {
+        "saved"
+    } else {
+        "legacy"
+    };
+    let expires_at = match &credentials {
+        Credentials::Bearer(token) => token
+            .split('.')
+            .nth(1)
+            .filter(|part| part.len() <= 16 * 1024)
+            .and_then(|part| {
+                use base64::Engine;
+                base64::engine::general_purpose::URL_SAFE_NO_PAD
+                    .decode(part)
+                    .ok()
+            })
+            .and_then(|bytes| serde_json::from_slice::<Value>(&bytes).ok())
+            .and_then(|claims| claims["exp"].as_u64()),
+        _ => None,
+    };
+    let expiry_status = expires_at
+        .map(|expiry| {
+            let now = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap_or_default()
+                .as_secs();
+            if expiry <= now {
+                "expired"
+            } else {
+                "not_expired"
+            }
+        })
+        .unwrap_or("unknown");
     Ok((
         credentials,
-        json!({"available": true, "source": source, "method": method, "verified": false}),
+        json!({"available": true, "source": source, "method": method, "verified": false, "selection": selection,
+            "expires_at": expires_at, "expiry_status": expiry_status, "expiry_source": expires_at.map(|_| "unverified_token_claim")}),
     ))
 }
 

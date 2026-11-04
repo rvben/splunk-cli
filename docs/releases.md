@@ -20,6 +20,10 @@ external contributors. The repository owner can integrate directly on main.
    from the current remote default branch.
 2. Run `vership status`, `vership config show`, and the relevant commands' `--help`.
 3. Run `make check`, `make conformance`, the Rust 1.90 check, and `actionlint`.
+   Run `SPLUNK_ACCEPT_LICENSE=yes make test-live-matrix` on the trusted x86
+   homelab runner. The release workflow repeats this matrix on the exact tag
+   and blocks PyPI publication on either version failing. The live workflow
+   also runs weekly and supports a manual pre-release dispatch on main.
    Build a local wheel/sdist, run `twine check --strict`, and install the wheel
    into a clean environment to exercise `--version` and `schema`.
 4. For a new version, run `vership bump patch --prepare` (or minor/major).
@@ -28,7 +32,8 @@ external contributors. The repository owner can integrate directly on main.
 5. Once the user approves pushing and publishing that release, run
    `vership release`. The tag starts the PyPI workflow. A workflow dispatch
    with `dry_run` builds and validates without publishing.
-6. Wait for every release job, then run `vership verify VERSION --targets tag,pypi`.
+6. Wait for every release job, including the Husker live compatibility gate,
+   then run `vership verify VERSION --targets tag,pypi`.
    Confirm all five wheels and the sdist on PyPI. Install from the published
    index, verify the version/schema, and reconcile the primary checkout with
    the remote default branch before reporting completion.

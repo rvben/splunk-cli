@@ -88,23 +88,31 @@ pub async fn browser_login(
         callback: &mut callback,
         reported: HashSet::new(),
     };
-    match select_browser_backend(preference)? {
-        BrowserBackend::Native(browser) => {
-            native_browser_session(settings, browser, &mut progress).await
+    let operation = async {
+        match select_browser_backend(preference)? {
+            BrowserBackend::Native(browser) => {
+                native_browser_session(settings, browser, &mut progress).await
+            }
+            BrowserBackend::WindowsBridge(browser) => {
+                let key = windows_browser_session(
+                    settings.web_url.as_str(),
+                    browser.as_deref(),
+                    &mut progress,
+                )
+                .await?;
+                progress.report(BrowserProgress::ValidatingSession);
+                validate_session(settings, &key).await?;
+                progress.report(BrowserProgress::SessionValidated);
+                Ok(key)
+            }
         }
-        BrowserBackend::WindowsBridge(browser) => {
-            let key = windows_browser_session(
-                settings.web_url.as_str(),
-                browser.as_deref(),
-                &mut progress,
-            )
-            .await?;
-            progress.report(BrowserProgress::ValidatingSession);
-            validate_session(settings, &key).await?;
-            progress.report(BrowserProgress::SessionValidated);
-            Ok(key)
-        }
-    }
+    };
+    tokio::time::timeout(LOGIN_TIMEOUT, operation)
+        .await
+        .map_err(|_| {
+            Error::new("timeout", "Browser sign-in timed out after five minutes")
+                .hint("Run auth login again to open a fresh private browser")
+        })?
 }
 
 /// Confirm that the management API accepts the session key.
@@ -296,6 +304,9 @@ impl Drop for NativeBrowser {
 
 async fn wait_for_debugger(process: &mut NativeBrowser) -> Result<String> {
     let http = reqwest::Client::builder()
+        // The debugging endpoint is private to this machine. Sending it to a
+        // configured enterprise proxy can leak the browser control channel.
+        .no_proxy()
         .timeout(Duration::from_secs(2))
         .build()
         .map_err(|_| Error::new("transport", "Cannot initialize the HTTP client"))?;
@@ -1068,20 +1079,26 @@ async fn windows_browser_session(
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
-        .kill_on_drop(true)
+        // EOF on stdin lets the bridge run its browser/profile cleanup, including
+        // when this future is cancelled or the CLI is forcibly terminated.
+        .kill_on_drop(false)
         .spawn()
         .map_err(|error| Error::new("transport", format!("failed to start PowerShell: {error}")))?;
     let mut stdin = child
         .stdin
         .take()
         .expect("PowerShell stdin was configured as piped");
-    stdin.write_all(bridge.as_bytes()).await.map_err(|error| {
-        Error::new(
-            "transport",
-            format!("failed to send browser bridge to PowerShell: {error}"),
-        )
-    })?;
-    drop(stdin);
+    let encoded = base64::engine::general_purpose::STANDARD.encode(bridge.as_bytes());
+    stdin
+        .write_all(format!("{encoded}\n").as_bytes())
+        .await
+        .map_err(|error| {
+            Error::new(
+                "transport",
+                format!("failed to send browser bridge to PowerShell: {error}"),
+            )
+        })?;
+    stdin.flush().await.map_err(bridge_error)?;
     let stdout = child
         .stdout
         .take()
@@ -1092,7 +1109,15 @@ async fn windows_browser_session(
         .expect("PowerShell stderr was configured as piped");
     let stderr_task = tokio::spawn(async move {
         let mut bytes = Vec::new();
-        stderr.read_to_end(&mut bytes).await.map(|_| bytes)
+        let mut chunk = [0u8; 4096];
+        loop {
+            let read = stderr.read(&mut chunk).await?;
+            if read == 0 {
+                return Ok::<_, std::io::Error>(bytes);
+            }
+            let keep = read.min((64 * 1024usize).saturating_sub(bytes.len()));
+            bytes.extend_from_slice(&chunk[..keep]);
+        }
     });
     let mut stdout = stdout;
     let mut stdout_bytes = Vec::new();
@@ -1101,6 +1126,9 @@ async fn windows_browser_session(
         let read = stdout.read(&mut chunk).await.map_err(bridge_error)?;
         if read == 0 {
             break;
+        }
+        if stdout_bytes.len() + read > 1024 * 1024 {
+            return Err(bridge_error("browser response exceeds 1 MiB"));
         }
         stdout_bytes.extend_from_slice(&chunk[..read]);
         let decoded = decode_powershell_output(&stdout_bytes);
@@ -1176,8 +1204,7 @@ fn powershell_progress(line: &str) -> Option<BrowserProgress> {
     }
 }
 
-const POWERSHELL_STDIN_BOOTSTRAP: &str =
-    "$script = [Console]::In.ReadToEnd(); & ([ScriptBlock]::Create($script))";
+const POWERSHELL_STDIN_BOOTSTRAP: &str = "$s = [Console]::In.ReadLine(); & ([ScriptBlock]::Create([Text.Encoding]::UTF8.GetString([Convert]::FromBase64String($s))))";
 const POWERSHELL_ARGS: [&str; 7] = [
     "-NoLogo",
     "-NoProfile",
@@ -1319,6 +1346,11 @@ $ProgressPreference = 'SilentlyContinue'
 $OutputEncoding = [Console]::OutputEncoding
 Write-Output 'SPLUNK_BRIDGE_READY'
 $script:reportedStages = @{}
+$script:lifelineBuffer = New-Object byte[] 1
+$script:lifeline = [Console]::OpenStandardInput().ReadAsync($script:lifelineBuffer, 0, 1)
+function Assert-Lifeline {
+    if ($script:lifeline.IsCompleted) { throw 'splunk-cli stopped waiting; sign-in cancelled.' }
+}
 function Write-Stage {
     param([string]$Stage)
     if (-not $script:reportedStages.ContainsKey($Stage)) {
@@ -1447,21 +1479,27 @@ function Invoke-CdpCommand {
     if ($SessionId) { $requestObject.sessionId = $SessionId }
     $request = $requestObject | ConvertTo-Json -Compress -Depth 6
     $requestBytes = [Text.Encoding]::UTF8.GetBytes($request)
-    $Socket.SendAsync([ArraySegment[byte]]::new($requestBytes), [Net.WebSockets.WebSocketMessageType]::Text, $true, [Threading.CancellationToken]::None).GetAwaiter().GetResult()
-    while ($true) {
-        $stream = [IO.MemoryStream]::new()
-        do {
-            $buffer = New-Object byte[] 65536
-            $result = $Socket.ReceiveAsync([ArraySegment[byte]]::new($buffer), [Threading.CancellationToken]::None).GetAwaiter().GetResult()
-            if ($result.MessageType -eq [Net.WebSockets.WebSocketMessageType]::Close) { throw 'The private browser sign-in channel closed.' }
-            $stream.Write($buffer, 0, $result.Count)
-        } while (-not $result.EndOfMessage)
-        $candidate = [Text.Encoding]::UTF8.GetString($stream.ToArray()) | ConvertFrom-Json
-        if ($candidate.id -eq $RequestId.Value) {
-            if ($candidate.error) { throw "Browser rejected ${Method}: $($candidate.error.message)" }
-            return $candidate
+    $timeout = [Threading.CancellationTokenSource]::new(5000)
+    try {
+        $Socket.SendAsync([ArraySegment[byte]]::new($requestBytes), [Net.WebSockets.WebSocketMessageType]::Text, $true, $timeout.Token).GetAwaiter().GetResult()
+        while ($true) {
+            $stream = [IO.MemoryStream]::new()
+            try {
+                do {
+                    $buffer = New-Object byte[] 65536
+                    $result = $Socket.ReceiveAsync([ArraySegment[byte]]::new($buffer), $timeout.Token).GetAwaiter().GetResult()
+                    if ($result.MessageType -eq [Net.WebSockets.WebSocketMessageType]::Close) { throw 'The private browser sign-in channel closed.' }
+                    if ($stream.Length + $result.Count -gt 1048576) { throw 'The private browser response exceeded 1 MiB.' }
+                    $stream.Write($buffer, 0, $result.Count)
+                } while (-not $result.EndOfMessage)
+                $candidate = [Text.Encoding]::UTF8.GetString($stream.ToArray()) | ConvertFrom-Json
+            } finally { $stream.Dispose() }
+            if ($candidate.id -eq $RequestId.Value) {
+                if ($candidate.error) { throw "Browser rejected ${Method}: $($candidate.error.message)" }
+                return $candidate
+            }
         }
-    }
+    } finally { $timeout.Dispose() }
 }
 try {
     $portProbe = [Net.Sockets.TcpListener]::new([Net.IPAddress]::Loopback, 0)
@@ -1482,6 +1520,7 @@ try {
     $channelDeadline = [DateTime]::UtcNow.AddSeconds(20)
     $version = $null
     while (-not $version -and [DateTime]::UtcNow -lt $channelDeadline) {
+        Assert-Lifeline
         if ($process.HasExited) { throw "Browser closed before sign-in completed ($($process.ExitCode))." }
         try {
             $version = Invoke-RestMethod -UseBasicParsing "http://127.0.0.1:$debugPort/json/version" -TimeoutSec 2
@@ -1489,16 +1528,19 @@ try {
         if (-not $version) { Start-Sleep -Milliseconds 200 }
     }
     if (-not $version.webSocketDebuggerUrl) {
-        throw 'The private browser opened, but its localhost sign-in channel did not become available within 20 seconds. Edge or Chrome may have ignored its isolated debugging options, or an enterprise browser policy may block browser automation. Set --browser to the other Windows browser and retry with --verbose.'
+        throw 'The private browser opened, but its localhost sign-in channel did not become available within 20 seconds. Edge or Chrome may have ignored its isolated debugging options, or an enterprise browser policy may block browser automation. Set --browser to the other Windows browser and retry; progress milestones on stderr identify the failing stage.'
     }
 
     Write-Stage 'browser-channel-ready'
     $socket = [Net.WebSockets.ClientWebSocket]::new()
-    $socket.ConnectAsync([Uri]$version.webSocketDebuggerUrl, [Threading.CancellationToken]::None).GetAwaiter().GetResult()
+    $connectTimeout = [Threading.CancellationTokenSource]::new(5000)
+    try { $socket.ConnectAsync([Uri]$version.webSocketDebuggerUrl, $connectTimeout.Token).GetAwaiter().GetResult() }
+    finally { $connectTimeout.Dispose() }
     $deadline = [DateTime]::UtcNow.AddMinutes(5)
     $lastStage = 'the authenticated Splunk page'
     Write-Stage 'waiting-splunk-page'
     while ([DateTime]::UtcNow -lt $deadline) {
+        Assert-Lifeline
         if ($process.HasExited) { throw "Browser closed before sign-in completed ($($process.ExitCode))." }
         $targets = Invoke-CdpCommand $socket ([ref]$requestId) 'Target.getTargets' @{} $null
         $target = $targets.result.targetInfos | Where-Object {
@@ -1551,8 +1593,13 @@ try {
         try { Invoke-CdpCommand $socket ([ref]$requestId) 'Browser.close' @{} $null | Out-Null } catch {}
         try { $socket.Dispose() } catch {}
     }
-    if ($process -and -not $process.HasExited) { try { Stop-Process -Id $process.Id -Force } catch {} }
-    if (Test-Path -LiteralPath $profile) { try { Remove-Item -LiteralPath $profile -Recurse -Force } catch {} }
+    if ($process -and -not $process.HasExited) {
+        try { & "$env:SystemRoot\System32\taskkill.exe" /PID $process.Id /T /F 2>$null | Out-Null } catch {}
+        try { $process.WaitForExit(1000) | Out-Null } catch {}
+    }
+    for ($cleanupAttempt = 0; $cleanupAttempt -lt 10 -and (Test-Path -LiteralPath $profile); $cleanupAttempt++) {
+        try { Remove-Item -LiteralPath $profile -Recurse -Force } catch { Start-Sleep -Milliseconds 300 }
+    }
 }
 if ($bridgeExitCode -ne 0) { exit $bridgeExitCode }
 "#;
@@ -1852,7 +1899,7 @@ mod tests {
     fn powershell_bridge_is_sent_over_stdin_instead_of_the_command_line() {
         assert_eq!(
             POWERSHELL_STDIN_BOOTSTRAP,
-            "$script = [Console]::In.ReadToEnd(); & ([ScriptBlock]::Create($script))"
+            "$s = [Console]::In.ReadLine(); & ([ScriptBlock]::Create([Text.Encoding]::UTF8.GetString([Convert]::FromBase64String($s))))"
         );
         assert!(!POWERSHELL_STDIN_BOOTSTRAP.contains("WINDOWS_BROWSER_BRIDGE"));
         assert!(!POWERSHELL_STDIN_BOOTSTRAP.contains("EncodedCommand"));
@@ -1968,7 +2015,14 @@ mod tests {
             .stdin
             .take()
             .unwrap()
-            .write_all(b"Write-Output 'SPLUNK_BRIDGE_READY'")
+            .write_all(
+                format!(
+                    "{}\n",
+                    base64::engine::general_purpose::STANDARD
+                        .encode(b"Write-Output 'SPLUNK_BRIDGE_READY'")
+                )
+                .as_bytes(),
+            )
             .unwrap();
         let output = child.wait_with_output().unwrap();
         assert!(

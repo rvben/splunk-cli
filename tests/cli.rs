@@ -103,6 +103,663 @@ async fn completed(server: &MockServer) {
         .await;
 }
 
+#[tokio::test]
+async fn safe_reads_retry_transient_status_but_dispatch_is_never_replayed() {
+    use std::sync::{
+        Arc,
+        atomic::{AtomicUsize, Ordering},
+    };
+    let server = MockServer::start().await;
+    let count = Arc::new(AtomicUsize::new(0));
+    let seen = count.clone();
+    Mock::given(method("GET"))
+        .and(path("/services/server/info"))
+        .respond_with(move |_: &wiremock::Request| {
+            if seen.fetch_add(1, Ordering::SeqCst) == 0 {
+                ResponseTemplate::new(503).insert_header("retry-after", "0")
+            } else {
+                ResponseTemplate::new(200).set_body_json(entries(json!({"version":"10.6"})))
+            }
+        })
+        .expect(2)
+        .mount(&server)
+        .await;
+    assert_eq!(
+        data(&run(&server, &["server", "info"]).await)["version"],
+        "10.6"
+    );
+    Mock::given(method("POST"))
+        .and(path("/servicesNS/nobody/search/search/jobs"))
+        .respond_with(ResponseTemplate::new(503).insert_header("retry-after", "0"))
+        .expect(1)
+        .mount(&server)
+        .await;
+    error(
+        &run(&server, &["jobs", "create", "index=main"]).await,
+        5,
+        "api",
+    );
+}
+
+#[tokio::test]
+async fn continuation_carries_fields_and_rejects_another_namespace_before_http() {
+    let server = MockServer::start().await;
+    completed(&server).await;
+    Mock::given(method("GET"))
+        .and(path(
+            "/servicesNS/nobody/search/search/v2/jobs/job-1/results",
+        ))
+        .and(query_param("f", "host"))
+        .respond_with(
+            ResponseTemplate::new(200).set_body_json(
+                json!({"results":[{"host":"a","count":"1"},{"host":"b","count":"2"}]}),
+            ),
+        )
+        .expect(3)
+        .mount(&server)
+        .await;
+    let first = data(
+        &run(
+            &server,
+            &[
+                "jobs",
+                "results",
+                "job-1",
+                "--limit",
+                "1",
+                "--fields",
+                "host,count",
+            ],
+        )
+        .await,
+    );
+    let cursor = first["next_cursor"].as_str().unwrap();
+    assert!(cursor.starts_with("v1."));
+    let next = data(&run(&server, &["search", "--cursor", cursor, "--limit", "1"]).await);
+    assert_eq!(next["offset"], 1);
+    let csv = run(
+        &server,
+        &[
+            "search", "--cursor", cursor, "--limit", "1", "--output", "csv",
+        ],
+    )
+    .await;
+    assert!(csv.status.success());
+    assert!(
+        String::from_utf8(csv.stdout)
+            .unwrap()
+            .starts_with("host,count\n")
+    );
+    error(
+        &run(&server, &["--app", "other", "search", "--cursor", cursor]).await,
+        2,
+        "usage",
+    );
+    error(
+        &run(&server, &["search", "--cursor", cursor, "--fields", "_raw"]).await,
+        2,
+        "usage",
+    );
+}
+
+#[tokio::test]
+async fn search_check_parses_without_dispatch_and_job_logs_redact_secrets() {
+    let server = MockServer::start().await;
+    Mock::given(method("POST"))
+        .and(path("/servicesNS/nobody/search/search/v2/parser"))
+        .and(body_string_contains("parse_only=true"))
+        .and(body_string_contains("enable_lookups=false"))
+        .and(body_string_contains("reload_macros=false"))
+        .and(body_string_contains("q=search+index%3Dmain"))
+        .respond_with(
+            ResponseTemplate::new(200).set_body_json(json!({"commands":[{"command":"search"}]})),
+        )
+        .expect(1)
+        .mount(&server)
+        .await;
+    let value = data(&run(&server, &["search", "check", "index=main"]).await);
+    assert_eq!(value["valid"], true);
+    assert_eq!(value["parse_only"], true);
+    Mock::given(method("GET"))
+        .and(path(
+            "/servicesNS/nobody/search/search/jobs/job-1/search.log",
+        ))
+        .respond_with(ResponseTemplate::new(200).set_body_string("WARN rejected test-secret\n"))
+        .expect(1)
+        .mount(&server)
+        .await;
+    let value = data(&run(&server, &["jobs", "logs", "job-1"]).await);
+    assert_eq!(value["job_id"], "job-1");
+    assert_eq!(value["log"], "WARN rejected [REDACTED]\n");
+}
+
+#[tokio::test]
+async fn streaming_csv_resumes_a_durable_page_without_a_second_header_or_partial_tail() {
+    use std::io::Write;
+    let server = MockServer::start().await;
+    completed(&server).await;
+    Mock::given(method("GET"))
+        .and(path(
+            "/servicesNS/nobody/search/search/v2/jobs/job-1/results",
+        ))
+        .and(query_param("offset", "0"))
+        .respond_with(
+            ResponseTemplate::new(200)
+                .set_body_json(json!({"results":[{"host":"a,1"},{"host":"b"}]})),
+        )
+        .expect(1)
+        .mount(&server)
+        .await;
+    Mock::given(method("GET"))
+        .and(path(
+            "/servicesNS/nobody/search/search/v2/jobs/job-1/results",
+        ))
+        .and(query_param("offset", "1"))
+        .respond_with(
+            ResponseTemplate::new(200)
+                .set_body_json(json!({"results":[{"host":"b"},{"host":"c"}]})),
+        )
+        .expect(1)
+        .mount(&server)
+        .await;
+    let dir = tempfile::tempdir().unwrap();
+    let file = dir.path().join("results.csv");
+    let args = [
+        "jobs",
+        "export",
+        "job-1",
+        "--stream",
+        "--output-file",
+        file.to_str().unwrap(),
+        "--record-format",
+        "csv",
+        "--fields",
+        "host",
+    ];
+    let mut first = args.to_vec();
+    first.extend(["--max-results", "1"]);
+    let result = data(&run(&server, &first).await);
+    assert_eq!(result["exported"], 1);
+    assert_eq!(result["has_more"], true);
+    assert_eq!(std::fs::read_to_string(&file).unwrap(), "host\n\"a,1\"\n");
+    std::fs::OpenOptions::new()
+        .append(true)
+        .open(&file)
+        .unwrap()
+        .write_all(b"partial row")
+        .unwrap();
+    let mut resume = args.to_vec();
+    resume.push("--resume");
+    let result = data(&run(&server, &resume).await);
+    assert_eq!(result["exported"], 3);
+    assert_eq!(result["has_more"], false);
+    assert_eq!(
+        std::fs::read_to_string(&file).unwrap(),
+        "host\n\"a,1\"\nb\nc\n"
+    );
+    let result = data(&run(&server, &resume).await);
+    assert_eq!(result["exported"], 3);
+    assert_eq!(result["has_more"], false);
+    error(&run(&server, &args).await, 7, "conflict");
+}
+
+#[tokio::test]
+async fn streaming_jsonl_can_exceed_the_buffered_limit_and_detects_modified_output() {
+    let server = MockServer::start().await;
+    completed(&server).await;
+    Mock::given(method("GET"))
+        .and(path(
+            "/servicesNS/nobody/search/search/v2/jobs/job-1/results",
+        ))
+        .respond_with(
+            ResponseTemplate::new(200)
+                .set_body_json(json!({"results":[{"_raw":"x".repeat(12 * 1024 * 1024)}]})),
+        )
+        .expect(3)
+        .mount(&server)
+        .await;
+    let dir = tempfile::tempdir().unwrap();
+    let file = dir.path().join("results.jsonl");
+    let args = [
+        "jobs",
+        "export",
+        "job-1",
+        "--stream",
+        "--output-file",
+        file.to_str().unwrap(),
+        "--page-size",
+        "1",
+    ];
+    let result = data(&run(&server, &args).await);
+    assert_eq!(result["exported"], 3);
+    assert_eq!(result["has_more"], false);
+    assert!(std::fs::metadata(&file).unwrap().len() > 32 * 1024 * 1024);
+    use std::io::Write;
+    std::fs::OpenOptions::new()
+        .write(true)
+        .open(&file)
+        .unwrap()
+        .write_all(b"bad")
+        .unwrap();
+    let mut resume = args.to_vec();
+    resume.push("--resume");
+    error(&run(&server, &resume).await, 7, "conflict");
+}
+
+#[tokio::test]
+async fn exports_refuse_finalized_or_canceled_jobs_before_fetching_or_creating_output() {
+    for state in [
+        json!({"isDone":true,"isFinalized":"1","dispatchState":"DONE"}),
+        json!({"isDone":true,"dispatchState":"USER_CANCEL"}),
+        json!({"isDone":true,"dispatchState":"QUIT"}),
+    ] {
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/servicesNS/nobody/search/search/jobs/job-1"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(entries(state)))
+            .mount(&server)
+            .await;
+        let dir = tempfile::tempdir().unwrap();
+        let file = dir.path().join("refused.jsonl");
+        for stream in [false, true] {
+            let mut args = vec!["jobs", "export", "job-1"];
+            if stream {
+                args.extend(["--stream", "--output-file", file.to_str().unwrap()]);
+            }
+            let out = run(&server, &args).await;
+            let failure = error(&out, 5, "api");
+            assert_eq!(failure["details"]["job_id"], "job-1");
+            assert!(!file.exists());
+            assert!(!dir.path().join("refused.jsonl.checkpoint.json").exists());
+        }
+        assert!(
+            server
+                .received_requests()
+                .await
+                .unwrap()
+                .iter()
+                .all(|r| r.url.path().ends_with("/jobs/job-1"))
+        );
+    }
+}
+
+#[tokio::test]
+async fn interrupted_export_initialization_can_resume_with_its_original_offset() {
+    use std::sync::{
+        Arc,
+        atomic::{AtomicUsize, Ordering},
+    };
+    let server = MockServer::start().await;
+    completed(&server).await;
+    let count = Arc::new(AtomicUsize::new(0));
+    Mock::given(method("GET"))
+        .and(path(
+            "/servicesNS/nobody/search/search/v2/jobs/job-1/results",
+        ))
+        .and(query_param("offset", "1"))
+        .respond_with(move |_: &wiremock::Request| {
+            if count.fetch_add(1, Ordering::SeqCst) == 0 {
+                ResponseTemplate::new(503).insert_header("retry-after", "10")
+            } else {
+                ResponseTemplate::new(200)
+                    .set_body_json(json!({"results":[{"host":"b"},{"host":"c"}]}))
+            }
+        })
+        .expect(2)
+        .mount(&server)
+        .await;
+    let dir = tempfile::tempdir().unwrap();
+    let file = dir.path().join("recovered.jsonl");
+    let args = [
+        "jobs",
+        "export",
+        "job-1",
+        "--stream",
+        "--output-file",
+        file.to_str().unwrap(),
+        "--offset",
+        "1",
+    ];
+    error(&run(&server, &args).await, 5, "api");
+    assert_eq!(std::fs::metadata(&file).unwrap().len(), 0);
+    std::fs::remove_file(&file).unwrap();
+    let mut args = args.to_vec();
+    args.push("--resume");
+    let value = data(&run(&server, &args).await);
+    assert_eq!(value["exported"], 2);
+    assert_eq!(value["has_more"], false);
+    assert_eq!(
+        std::fs::read_to_string(file).unwrap(),
+        "{\"host\":\"b\"}\n{\"host\":\"c\"}\n"
+    );
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn interrupted_streaming_resume_reports_its_durable_checkpoint() {
+    let server = MockServer::start().await;
+    completed(&server).await;
+    Mock::given(method("GET"))
+        .and(path(
+            "/servicesNS/nobody/search/search/v2/jobs/job-1/results",
+        ))
+        .respond_with(
+            ResponseTemplate::new(200)
+                .set_body_json(json!({"results":[{"host":"a"},{"host":"b"}]})),
+        )
+        .mount(&server)
+        .await;
+    let dir = tempfile::tempdir().unwrap();
+    let file = dir.path().join("interrupted.jsonl");
+    let args = [
+        "jobs",
+        "export",
+        "job-1",
+        "--stream",
+        "--output-file",
+        file.to_str().unwrap(),
+        "--max-results",
+        "1",
+    ];
+    assert_eq!(data(&run(&server, &args).await)["exported"], 1);
+    Mock::given(method("GET"))
+        .and(path("/servicesNS/nobody/search/search/jobs/job-1"))
+        .respond_with(
+            ResponseTemplate::new(200)
+                .set_body_json(entries(json!({"isDone":true,"resultCount":3})))
+                .set_delay(std::time::Duration::from_secs(30)),
+        )
+        .with_priority(1)
+        .mount(&server)
+        .await;
+    let child = command(&args)
+        .arg("--resume")
+        .env("SPLUNK_URL", server.uri())
+        .env("SPLUNK_TOKEN", "fixture")
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped())
+        .spawn()
+        .unwrap();
+    let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(10);
+    while server
+        .received_requests()
+        .await
+        .unwrap()
+        .iter()
+        .filter(|r| r.url.path().ends_with("/jobs/job-1"))
+        .count()
+        < 2
+        && tokio::time::Instant::now() < deadline
+    {
+        tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+    }
+    Command::new("kill")
+        .args(["-INT", &child.id().to_string()])
+        .status()
+        .unwrap();
+    let pid = child.id();
+    // Drain both pipes while waiting: recovery guidance can exceed a pipe's capacity.
+    let output = tokio::task::spawn_blocking(move || child.wait_with_output().unwrap());
+    let output = match tokio::time::timeout(std::time::Duration::from_secs(10), output).await {
+        Ok(output) => output.unwrap(),
+        Err(_) => {
+            let _ = Command::new("kill")
+                .args(["-KILL", &pid.to_string()])
+                .status();
+            panic!("Streaming export did not stop after SIGINT");
+        }
+    };
+    let failure = error(&output, 130, "interrupted");
+    assert_eq!(failure["details"]["resumable"], true);
+    assert_eq!(
+        failure["details"]["output_file"],
+        file.canonicalize().unwrap().to_str().unwrap()
+    );
+    assert!(
+        failure["details"]["checkpoint"]
+            .as_str()
+            .unwrap()
+            .ends_with(".checkpoint.json")
+    );
+    assert!(failure["hint"].as_str().unwrap().contains("--resume"));
+    assert_eq!(std::fs::read_to_string(file).unwrap(), "{\"host\":\"a\"}\n");
+}
+
+#[test]
+fn every_command_has_a_relevant_help_example_offline() {
+    let schema = data(&command(&["schema"]).output().unwrap());
+    for item in schema["commands"].as_array().unwrap() {
+        let name = item["name"].as_str().unwrap();
+        let mut args: Vec<_> = name.split(' ').collect();
+        args.push("--help");
+        let result = command(&args).output().unwrap();
+        assert!(result.status.success(), "{name}");
+        let help = String::from_utf8(result.stdout).unwrap();
+        assert!(help.contains("Examples:"), "{name}: missing example");
+        assert!(
+            help.contains(&format!("splunk-cli {name}")),
+            "{name}: missing command example"
+        );
+    }
+}
+
+#[tokio::test]
+async fn empty_terminal_results_explain_the_next_step() {
+    let server = MockServer::start().await;
+    Mock::given(method("GET"))
+        .and(path("/services/data/indexes"))
+        .respond_with(
+            ResponseTemplate::new(200).set_body_json(json!({"entry":[],"paging":{"total":0}})),
+        )
+        .mount(&server)
+        .await;
+    let result = run(&server, &["indexes", "list", "--output", "text"]).await;
+    assert!(result.status.success());
+    assert!(
+        String::from_utf8(result.stdout)
+            .unwrap()
+            .contains("Check your Splunk role")
+    );
+    let result = command(&["profile", "list", "--output", "text"])
+        .output()
+        .unwrap();
+    assert!(
+        String::from_utf8(result.stdout)
+            .unwrap()
+            .contains("splunk-cli init")
+    );
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn browser_debugging_stays_on_loopback_when_http_proxies_are_configured() {
+    use std::os::unix::fs::PermissionsExt;
+    let server = MockServer::start().await;
+    let proxy = MockServer::start().await;
+    let response = json!({"webSocketDebuggerUrl":"ws://127.0.0.1:1/devtools/browser/test"});
+    Mock::given(method("GET"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(response.clone()))
+        .expect(1)
+        .mount(&server)
+        .await;
+    Mock::given(method("GET"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(response))
+        .expect(0)
+        .mount(&proxy)
+        .await;
+    let dir = tempfile::tempdir().unwrap();
+    let browser = dir.path().join("fixture-chromium");
+    std::fs::write(&browser, "#!/bin/sh\nfor arg in \"$@\"; do\n case \"$arg\" in --user-data-dir=*) profile=${arg#*=};; esac\ndone\nprintf '%s\\n' \"$BROWSER_TEST_PORT\" > \"$profile/DevToolsActivePort\"\nexec sleep 60\n").unwrap();
+    std::fs::set_permissions(&browser, std::fs::Permissions::from_mode(0o700)).unwrap();
+    let mut cmd = command(&[
+        "auth",
+        "login",
+        "--method",
+        "browser",
+        "--browser",
+        browser.to_str().unwrap(),
+        "--url",
+        "https://splunk.invalid:8089",
+        "--insecure-storage",
+        "--config",
+        dir.path().join("config.toml").to_str().unwrap(),
+    ]);
+    cmd.env("BROWSER_TEST_PORT", server.address().port().to_string())
+        .env("HTTP_PROXY", proxy.uri())
+        .env("http_proxy", proxy.uri())
+        .env_remove("NO_PROXY")
+        .env_remove("no_proxy");
+    let result = tokio::task::spawn_blocking(move || cmd.output().unwrap())
+        .await
+        .unwrap();
+    error(&result, 10, "transport");
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn private_ca_tls_requires_explicit_trust_and_validates_the_server() {
+    let dir = tempfile::tempdir().unwrap();
+    let certificate = dir.path().join("ca.pem");
+    let key = dir.path().join("key.pem");
+    let root_key = dir.path().join("root-key.pem");
+    let leaf = dir.path().join("server.pem");
+    let csr = dir.path().join("server.csr");
+    let extensions = dir.path().join("extensions.cnf");
+    let root_config = dir.path().join("root.cnf");
+    std::fs::write(&root_config, "[req]\nprompt=no\ndistinguished_name=dn\nx509_extensions=ca\n[dn]\nCN=Splunk CLI test CA\n[ca]\nbasicConstraints=critical,CA:TRUE\nkeyUsage=critical,keyCertSign,cRLSign\n").unwrap();
+    std::fs::write(&extensions, "subjectAltName=IP:127.0.0.1\nbasicConstraints=critical,CA:FALSE\nkeyUsage=critical,digitalSignature,keyEncipherment\nextendedKeyUsage=serverAuth\n").unwrap();
+    let openssl = |args: &[&str]| {
+        let result = Command::new("openssl").args(args).output().unwrap();
+        assert!(
+            result.status.success(),
+            "Could not create disposable TLS certificates"
+        );
+    };
+    let output = Command::new("openssl")
+        .args([
+            "req",
+            "-x509",
+            "-newkey",
+            "rsa:2048",
+            "-nodes",
+            "-days",
+            "1",
+            "-config",
+            root_config.to_str().unwrap(),
+            "-keyout",
+            root_key.to_str().unwrap(),
+            "-out",
+            certificate.to_str().unwrap(),
+        ])
+        .output()
+        .unwrap();
+    assert!(
+        output.status.success(),
+        "Could not create a disposable TLS certificate"
+    );
+    openssl(&[
+        "req",
+        "-new",
+        "-newkey",
+        "rsa:2048",
+        "-nodes",
+        "-subj",
+        "/CN=localhost",
+        "-keyout",
+        key.to_str().unwrap(),
+        "-out",
+        csr.to_str().unwrap(),
+    ]);
+    openssl(&[
+        "x509",
+        "-req",
+        "-in",
+        csr.to_str().unwrap(),
+        "-CA",
+        certificate.to_str().unwrap(),
+        "-CAkey",
+        root_key.to_str().unwrap(),
+        "-CAcreateserial",
+        "-days",
+        "1",
+        "-extfile",
+        extensions.to_str().unwrap(),
+        "-out",
+        leaf.to_str().unwrap(),
+    ]);
+    let ready = dir.path().join("ready");
+    let script = r#"
+import http.server, ssl, sys
+from pathlib import Path
+class Handler(http.server.BaseHTTPRequestHandler):
+    def do_GET(self):
+        body = b'{"entry":[{"name":"server","content":{"version":"tls-test"}}]}'
+        self.send_response(200)
+        self.send_header('Content-Type', 'application/json')
+        self.send_header('Content-Length', str(len(body)))
+        self.end_headers()
+        self.wfile.write(body)
+    def log_message(self, *args): pass
+server = http.server.HTTPServer(('127.0.0.1', 0), Handler)
+context = ssl.SSLContext(ssl.PROTOCOL_TLS_SERVER)
+context.load_cert_chain(sys.argv[1], sys.argv[2])
+server.socket = context.wrap_socket(server.socket, server_side=True)
+Path(sys.argv[3]).write_text(str(server.server_port))
+server.serve_forever()
+"#;
+    struct Cleanup(std::process::Child);
+    impl Drop for Cleanup {
+        fn drop(&mut self) {
+            let _ = self.0.kill();
+            let _ = self.0.wait();
+        }
+    }
+    let _server = Cleanup(
+        Command::new("python3")
+            .args([
+                "-c",
+                script,
+                leaf.to_str().unwrap(),
+                key.to_str().unwrap(),
+                ready.to_str().unwrap(),
+            ])
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .spawn()
+            .unwrap(),
+    );
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+    while !ready.exists() {
+        assert!(
+            std::time::Instant::now() < deadline,
+            "TLS fixture failed to start"
+        );
+        tokio::time::sleep(std::time::Duration::from_millis(25)).await;
+    }
+    let url = format!(
+        "https://127.0.0.1:{}",
+        std::fs::read_to_string(ready).unwrap()
+    );
+    let mut cmd = command(&["server", "info"]);
+    cmd.env("SPLUNK_URL", &url)
+        .env("SPLUNK_TOKEN", "test-secret")
+        .env("NO_PROXY", "127.0.0.1")
+        .env("no_proxy", "127.0.0.1");
+    let failure = tokio::task::spawn_blocking(move || cmd.output().unwrap())
+        .await
+        .unwrap();
+    error(&failure, 10, "transport");
+    let mut cmd = command(&["server", "info", "--ca-cert", certificate.to_str().unwrap()]);
+    cmd.env("SPLUNK_URL", url)
+        .env("SPLUNK_TOKEN", "test-secret")
+        .env("NO_PROXY", "127.0.0.1")
+        .env("no_proxy", "127.0.0.1");
+    let success = tokio::task::spawn_blocking(move || cmd.output().unwrap())
+        .await
+        .unwrap();
+    assert_eq!(data(&success)["version"], "tls-test");
+}
+
 #[test]
 fn offline_schema_ignores_broken_config_and_credentials() {
     let dir = tempfile::tempdir().unwrap();
@@ -654,7 +1311,7 @@ async fn search_cursor_reuses_the_existing_job_without_submitting_spl() {
         .await;
     let value = data(&run(&server, &["search", "--cursor", "job-1:1", "--limit", "1"]).await);
     assert_eq!(value["job_id"], "job-1");
-    assert_eq!(value["next_cursor"], "job-1:2");
+    assert!(value["next_cursor"].as_str().unwrap().starts_with("v1."));
     assert_eq!(value["items"], json!([{"host": "b"}]));
     assert!(
         server
@@ -1049,7 +1706,7 @@ async fn bounded_export_reads_pages_of_one_job_and_returns_a_continuation() {
     assert_eq!(value["items"], json!([{"n":"1"},{"n":"2"},{"n":"3"}]));
     assert_eq!(value["job_id"], "job-1");
     assert_eq!(value["has_more"], true);
-    assert_eq!(value["next_cursor"], "job-1:3");
+    assert!(value["next_cursor"].as_str().unwrap().starts_with("v1."));
     assert_eq!(value["next_offset"], 3);
     assert_eq!(value["limit"], 3);
     assert!(
@@ -1377,7 +2034,7 @@ async fn export_byte_bound_returns_records_and_a_precise_continuation() {
     let value = data(&out);
     assert_eq!(value["items"].as_array().unwrap().len(), 4088);
     assert_eq!(value["next_offset"], 4088);
-    assert_eq!(value["next_cursor"], "job-1:4088");
+    assert!(value["next_cursor"].as_str().unwrap().starts_with("v1."));
     assert_eq!(value["byte_limit_reached"], true);
     assert_eq!(value["bounded"], true);
     assert!(serde_json::to_vec(&value["items"]).unwrap().len() <= 32 * 1024 * 1024);
@@ -1676,6 +2333,19 @@ async fn file_login_integrates_with_active_profiles_diagnostics_and_scoped_remov
     let status = data(&invoke(&["auth", "status", "--offline"]));
     assert_eq!(status["profile"], "work");
     assert_eq!(status["credentials"]["source"], "file");
+    assert_eq!(status["credentials"]["selection"], "saved");
+    assert_eq!(status["credentials"]["expiry_status"], "unknown");
+    error(&invoke(&["auth", "migrate", "--to", "file"]), 2, "usage");
+    let migration = data(&invoke(&[
+        "auth",
+        "migrate",
+        "--to",
+        "file",
+        "--insecure-storage",
+    ]));
+    assert_eq!(migration["changed"], false);
+    assert_eq!(migration["credential_store"], "file");
+
     assert!(status["authenticated"].is_null());
     let doctor = data(&invoke(&["doctor", "--offline"]));
     assert_eq!(doctor["credentials"]["source"], "file");
@@ -1692,8 +2362,44 @@ async fn file_login_integrates_with_active_profiles_diagnostics_and_scoped_remov
     .await
     .unwrap();
     assert_eq!(data(&online)["authenticated"], true);
-    let removed = data(&invoke(&["profile", "remove", "work", "--yes"]));
+    let preview = data(&invoke(&[
+        "profile",
+        "rename",
+        "work",
+        "renamed",
+        "--dry-run",
+    ]));
+    assert_eq!(preview["dry_run"], true);
+    assert_eq!(
+        data(&invoke(&["auth", "status", "--offline"]))["profile"],
+        "work"
+    );
+    let renamed = data(&invoke(&["profile", "rename", "work", "renamed"]));
+    assert_eq!(renamed["credentials_moved"], 1);
+    let status = data(&invoke(&["auth", "status", "--offline"]));
+    assert_eq!(status["profile"], "renamed");
+    assert_eq!(status["credentials"]["source"], "file");
+    let saved = std::fs::read(dir.path().join("credentials.json")).unwrap();
+    let removed = data(&invoke(&["profile", "remove", "renamed", "--yes"]));
     assert_eq!(removed["credentials_removed"], true);
+    // A previously unavailable store may later expose an obsolete entry.
+    // The tombstone must prevent selection, while logout can still clean it.
+    std::fs::write(dir.path().join("credentials.json"), saved).unwrap();
+    let stale = |args: &[&str]| {
+        command(&[
+            "--config",
+            &first,
+            "--profile",
+            "renamed",
+            "--url",
+            &server.uri(),
+        ])
+        .args(args)
+        .output()
+        .unwrap()
+    };
+    error(&stale(&["auth", "status", "--offline"]), 3, "auth");
+    assert_eq!(data(&stale(&["auth", "logout"]))["removed"], true);
     let remaining: Value =
         serde_json::from_slice(&std::fs::read(dir.path().join("credentials.json")).unwrap())
             .unwrap();
@@ -1737,4 +2443,341 @@ fn config_cannot_collide_with_the_credential_store() {
     let failure = error(&out, 2, "usage");
     assert!(failure["message"].as_str().unwrap().contains("reserved"));
     assert!(!config.exists());
+}
+
+#[cfg(windows)]
+#[test]
+fn terminating_windows_login_closes_its_browser_and_removes_the_private_profile() {
+    use std::{
+        io::Read,
+        time::{Duration, Instant},
+    };
+    let dir = tempfile::tempdir().unwrap();
+    let ready = dir.path().join("ready");
+    let source = dir.path().join("fixture.rs");
+    let browser = dir.path().join("fixture-chromium.exe");
+    std::fs::write(&source, r#"
+fn main() {
+    let profile = std::env::args().find_map(|a| a.strip_prefix("--user-data-dir=").map(str::to_owned)).unwrap();
+    std::fs::create_dir_all(&profile).unwrap();
+    std::fs::write(std::env::var("BROWSER_TEST_READY").unwrap(), format!("{}\n{}\n", std::process::id(), profile)).unwrap();
+    std::thread::sleep(std::time::Duration::from_secs(60));
+}
+"#).unwrap();
+    assert!(
+        Command::new("rustc")
+            .args(["--crate-name", "fixture_chromium"])
+            .arg(&source)
+            .arg("-o")
+            .arg(&browser)
+            .status()
+            .unwrap()
+            .success()
+    );
+    struct Cleanup {
+        cli: std::process::Child,
+        ready: std::path::PathBuf,
+    }
+    impl Drop for Cleanup {
+        fn drop(&mut self) {
+            let _ = self.cli.kill();
+            let _ = self.cli.wait();
+            if let Ok(text) = std::fs::read_to_string(&self.ready) {
+                let mut lines = text.lines();
+                if let Some(pid) = lines.next() {
+                    let _ = Command::new("taskkill.exe")
+                        .args(["/PID", pid, "/T", "/F"])
+                        .stdout(std::process::Stdio::null())
+                        .stderr(std::process::Stdio::null())
+                        .status();
+                }
+                if let Some(profile) = lines.next() {
+                    let _ = std::fs::remove_dir_all(profile);
+                }
+            }
+        }
+    }
+    let mut cleanup = Cleanup {
+        cli: command(&[
+            "auth",
+            "login",
+            "--method",
+            "browser",
+            "--browser",
+            browser.to_str().unwrap(),
+            "--url",
+            "https://splunk.invalid:8089",
+            "--insecure-storage",
+            "--config",
+            dir.path().join("config.toml").to_str().unwrap(),
+        ])
+        .env("BROWSER_TEST_READY", &ready)
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::piped())
+        .spawn()
+        .unwrap(),
+        ready,
+    };
+    let deadline = Instant::now() + Duration::from_secs(20);
+    while !cleanup.ready.exists() {
+        if cleanup.cli.try_wait().unwrap().is_some() {
+            let mut stderr = String::new();
+            cleanup
+                .cli
+                .stderr
+                .take()
+                .unwrap()
+                .read_to_string(&mut stderr)
+                .unwrap();
+            panic!("Windows browser fixture did not start: {stderr}");
+        }
+        assert!(Instant::now() < deadline, "Windows browser did not start");
+        std::thread::sleep(Duration::from_millis(25));
+    }
+    let text = std::fs::read_to_string(&cleanup.ready).unwrap();
+    let mut lines = text.lines();
+    let pid = lines.next().unwrap();
+    let profile = std::path::PathBuf::from(lines.next().unwrap());
+    cleanup.cli.kill().unwrap();
+    cleanup.cli.wait().unwrap();
+    let deadline = Instant::now() + Duration::from_secs(12);
+    while profile.exists() && Instant::now() < deadline {
+        std::thread::sleep(Duration::from_millis(50));
+    }
+    assert!(
+        !profile.exists(),
+        "Windows private profile survived CLI termination"
+    );
+    let alive = Command::new("tasklist.exe")
+        .args(["/FI", &format!("PID eq {pid}"), "/FO", "CSV", "/NH"])
+        .output()
+        .unwrap();
+    assert!(
+        !String::from_utf8_lossy(&alive.stdout).contains(&format!("\"{pid}\"")),
+        "Windows browser survived CLI termination"
+    );
+    assert!(!dir.path().join("config.toml").exists());
+}
+
+#[test]
+fn offline_auth_reports_expiry_as_an_unverified_token_claim() {
+    let out = command(&[
+        "auth",
+        "status",
+        "--offline",
+        "--url",
+        "https://splunk.invalid:8089",
+    ])
+    .env("SPLUNK_TOKEN", "eyJhbGciOiJub25lIn0.eyJleHAiOjF9.synthetic")
+    .output()
+    .unwrap();
+    let status = data(&out);
+    assert_eq!(status["credentials"]["expires_at"], 1);
+    assert_eq!(status["credentials"]["expiry_status"], "expired");
+    assert_eq!(
+        status["credentials"]["expiry_source"],
+        "unverified_token_claim"
+    );
+    assert_eq!(status["credentials"]["verified"], false);
+    assert!(status["authenticated"].is_null());
+}
+
+#[test]
+fn individual_saved_settings_can_be_reset_without_deleting_the_profile() {
+    let dir = tempfile::tempdir().unwrap();
+    let config = dir.path().join("config.toml");
+    let config = config.to_str().unwrap();
+    data(
+        &command(&[
+            "--config",
+            config,
+            "--profile",
+            "work",
+            "config",
+            "set",
+            "--url",
+            "https://splunk.invalid:8089",
+            "--app",
+            "custom",
+            "--timeout",
+            "61",
+        ])
+        .output()
+        .unwrap(),
+    );
+    let before = std::fs::read(config).unwrap();
+    let preview = data(
+        &command(&[
+            "--config",
+            config,
+            "--profile",
+            "work",
+            "config",
+            "unset",
+            "app",
+            "timeout",
+            "--dry-run",
+        ])
+        .output()
+        .unwrap(),
+    );
+    assert_eq!(preview["changed"], true);
+    assert_eq!(std::fs::read(config).unwrap(), before);
+    data(
+        &command(&[
+            "--config",
+            config,
+            "--profile",
+            "work",
+            "config",
+            "unset",
+            "app",
+            "timeout",
+        ])
+        .output()
+        .unwrap(),
+    );
+    let settings = data(
+        &command(&["--config", config, "--profile", "work", "config", "show"])
+            .output()
+            .unwrap(),
+    );
+    assert_eq!(settings["app"], "search");
+    assert_eq!(settings["timeout"], 30);
+    assert_eq!(settings["url"], "https://splunk.invalid:8089/");
+    let again = data(
+        &command(&[
+            "--config",
+            config,
+            "--profile",
+            "work",
+            "config",
+            "unset",
+            "app",
+            "timeout",
+        ])
+        .output()
+        .unwrap(),
+    );
+    assert_eq!(again["changed"], false);
+}
+
+#[test]
+fn maintenance_commands_declare_effects_and_result_shapes() {
+    for path in [
+        ["auth", "migrate"],
+        ["profile", "rename"],
+        ["config", "unset"],
+    ] {
+        let contract = data(&command(&["schema", path[0], path[1]]).output().unwrap());
+        let item = &contract["commands"][0];
+        assert_eq!(item["effects"], "idempotent");
+        assert!(item["stdout_schema"]["properties"]["changed"].is_object());
+        assert!(
+            item["args"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .any(|arg| arg["name"] == "--dry-run")
+        );
+    }
+}
+
+#[cfg(unix)]
+#[test]
+fn canceling_browser_login_terminates_the_browser_and_removes_its_private_profile() {
+    use std::os::unix::fs::PermissionsExt;
+    use std::{
+        path::PathBuf,
+        process::{Child, Stdio},
+        time::{Duration, Instant},
+    };
+    struct Cleanup {
+        cli: Option<Child>,
+        browser: Option<String>,
+        profile: Option<PathBuf>,
+    }
+    impl Drop for Cleanup {
+        fn drop(&mut self) {
+            if let Some(child) = self.cli.as_mut() {
+                let _ = child.kill();
+                let _ = child.wait();
+            }
+            if let Some(pid) = &self.browser {
+                let _ = Command::new("kill")
+                    .args(["-KILL", pid])
+                    .stdout(Stdio::null())
+                    .stderr(Stdio::null())
+                    .status();
+            }
+            if let Some(path) = &self.profile {
+                let _ = std::fs::remove_dir_all(path);
+            }
+        }
+    }
+    let dir = tempfile::tempdir().unwrap();
+    let browser = dir.path().join("fixture-chromium");
+    let ready = dir.path().join("ready");
+    std::fs::write(&browser,"#!/bin/sh\nfor arg in \"$@\"; do\ncase \"$arg\" in --user-data-dir=*) printf '%s\\n' \"${arg#*=}\" > \"$BROWSER_TEST_READY\";; esac\ndone\nprintf '%s\\n' \"$$\" >> \"$BROWSER_TEST_READY\"\nexec sleep 60\n").unwrap();
+    std::fs::set_permissions(&browser, std::fs::Permissions::from_mode(0o700)).unwrap();
+    let child = command(&[
+        "auth",
+        "login",
+        "--method",
+        "browser",
+        "--browser",
+        browser.to_str().unwrap(),
+        "--url",
+        "https://splunk.invalid:8089",
+        "--config",
+        dir.path().join("config.toml").to_str().unwrap(),
+        "--insecure-storage",
+    ])
+    .env("BROWSER_TEST_READY", &ready)
+    .stdout(Stdio::piped())
+    .stderr(Stdio::piped())
+    .spawn()
+    .unwrap();
+    let mut cleanup = Cleanup {
+        cli: Some(child),
+        browser: None,
+        profile: None,
+    };
+    let deadline = Instant::now() + Duration::from_secs(10);
+    let contents = loop {
+        if let Ok(contents) = std::fs::read_to_string(&ready)
+            && contents.lines().count() == 2
+        {
+            break contents;
+        }
+        assert!(Instant::now() < deadline, "Browser did not start");
+        std::thread::sleep(Duration::from_millis(20));
+    };
+    let mut lines = contents.lines();
+    cleanup.profile = Some(lines.next().unwrap().into());
+    cleanup.browser = Some(lines.next().unwrap().into());
+    assert!(
+        Command::new("kill")
+            .args(["-INT", &cleanup.cli.as_ref().unwrap().id().to_string()])
+            .status()
+            .unwrap()
+            .success()
+    );
+    while cleanup.cli.as_mut().unwrap().try_wait().unwrap().is_none() {
+        assert!(
+            Instant::now() < deadline,
+            "Browser cancellation did not finish"
+        );
+        std::thread::sleep(Duration::from_millis(20));
+    }
+    let out = cleanup.cli.take().unwrap().wait_with_output().unwrap();
+    error(&out, 130, "interrupted");
+    assert!(
+        !cleanup.profile.as_ref().unwrap().exists(),
+        "Private browser profile survived cancellation"
+    );
+    assert!(
+        !dir.path().join("config.toml").exists(),
+        "Canceled login saved connection state"
+    );
 }

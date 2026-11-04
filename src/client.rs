@@ -171,19 +171,71 @@ impl Client {
         segments: &[&str],
         params: &[(String, String)],
     ) -> Result<Value> {
+        self.request_inner(method, namespaced, segments, params, false)
+            .await
+    }
+
+    pub async fn text(&self, namespaced: bool, segments: &[&str]) -> Result<String> {
+        self.request_inner(Method::GET, namespaced, segments, &[], true)
+            .await?
+            .as_str()
+            .map(str::to_owned)
+            .ok_or_else(Error::invalid_response)
+    }
+
+    async fn request_inner(
+        &self,
+        method: Method,
+        namespaced: bool,
+        segments: &[&str],
+        params: &[(String, String)],
+        raw: bool,
+    ) -> Result<Value> {
         let url = endpoint(&self.settings, namespaced, segments)?;
         let mut request = self.http.request(method.clone(), url);
         if let Credentials::Basic(user, password) = &self.credentials {
             request = request.basic_auth(user, Some(password));
         }
         let mut params = params.to_vec();
-        params.push(("output_mode".into(), "json".into()));
+        if !raw {
+            params.push(("output_mode".into(), "json".into()));
+        }
         request = if method == Method::POST {
             request.form(&params)
         } else {
             request.query(&params)
         };
-        let response = request.send().await.map_err(network_error)?;
+        let mut attempt = 0;
+        let response = loop {
+            let response = request
+                .try_clone()
+                .ok_or_else(|| Error::new("transport", "Cannot prepare request"))?
+                .send()
+                .await
+                .map_err(network_error)?;
+            // Only replay reads: even a failed dispatch may have created a job.
+            if method == Method::GET
+                && attempt < 2
+                && matches!(response.status().as_u16(), 429 | 502 | 503 | 504)
+            {
+                let delay = match response.headers().get("retry-after") {
+                    Some(value) => value
+                        .to_str()
+                        .ok()
+                        .and_then(|v| v.parse::<u64>().ok())
+                        .filter(|v| *v <= 2)
+                        .map(Duration::from_secs),
+                    None => Some(Duration::from_millis(250 * (1 << attempt))),
+                };
+                if let Some(delay) = delay {
+                    attempt += 1;
+                    drop(response);
+                    tokio::time::sleep(delay).await;
+                    continue;
+                }
+            }
+            break response;
+        };
         let status = response.status();
         let retry_after = response
             .headers()
@@ -240,6 +292,10 @@ impl Client {
                 _ => None,
             };
             return Err(error);
+        }
+        if raw {
+            let text = std::str::from_utf8(&body).map_err(|_| Error::invalid_response())?;
+            return Ok(json!(self.credentials.redact(text)));
         }
         if body.is_empty() {
             return Ok(json!({}));

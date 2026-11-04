@@ -6,6 +6,24 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/).
 
 ## [Unreleased]
 
+### Added
+
+- Durable, page-bounded CSV/JSONL file exports with checkpoints, verified resume, and a single CSV header.
+- Parse-only `search check` and credential-redacted `jobs logs` for investigation.
+- Explicit `auth migrate`, deterministic saved-store selection, and unverified token-expiry diagnostics.
+- Credential-preserving profile renaming and individual saved-setting resets.
+- Command-specific help examples, actionable empty states, and display-truncation guidance.
+- A documented 0.1.x compatibility policy for commands, JSON, errors, cursors, and checkpoints.
+- Trusted weekly and release-gating live checks on isolated Husker infrastructure, with pinned Splunk versions and restricted-user coverage.
+
+### Fixed
+
+- Bind new continuations to their server, namespace, and ordered field selection.
+- Retry transient safe-read HTTP responses within a bounded budget; never replay dispatches.
+- Clean up browser login on cancellation, including Windows CLI termination, enforce a full sign-in deadline, and keep browser debugging off HTTP proxies.
+- Preserve streaming checkpoint recovery details on interruption and refuse incomplete finalized searches.
+- Preserve logged-out state when stale credentials reappear, while allowing later cleanup.
+
 ## [0.0.3](https://github.com/rvben/splunk-cli/compare/v0.0.2...v0.0.3) - 2026-11-04
 
 ### Added

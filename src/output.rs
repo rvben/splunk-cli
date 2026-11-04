@@ -97,6 +97,14 @@ fn fit(text: &str, width: usize) -> String {
     result
 }
 
+pub(crate) fn quote_csv(text: String) -> String {
+    if text.contains([',', '\n', '\r', '"']) {
+        format!("\"{}\"", text.replace('"', "\"\""))
+    } else {
+        text
+    }
+}
+
 fn width() -> usize {
     std::env::var("COLUMNS")
         .ok()
@@ -166,6 +174,7 @@ fn table_cell(key: &str, value: &Value) -> String {
 fn table(value: &Value, fields: &[String], preferred: &[&str], terminal_width: usize) -> String {
     let rows = rows(value);
     let mut columns = columns(&rows, fields);
+    let available_columns = columns.len();
     if fields.is_empty() && !preferred.is_empty() {
         let selected: Vec<_> = preferred
             .iter()
@@ -177,7 +186,6 @@ fn table(value: &Value, fields: &[String], preferred: &[&str], terminal_width: u
         }
     }
     // Keep at least one visible column, even on very narrow terminals.
-    let available_columns = columns.len();
     columns.truncate(((terminal_width + 2) / 6).max(1));
     let mut widths: Vec<usize> = columns
         .iter()
@@ -239,11 +247,21 @@ fn table(value: &Value, fields: &[String], preferred: &[&str], terminal_width: u
         }));
     }
     if available_columns > columns.len() {
-        lines.push(fit(
+        lines.extend(wrap(
             &format!(
                 "Showing {} of {available_columns} columns; use --output json for all columns.",
                 columns.len()
             ),
+            terminal_width,
+        ));
+    }
+    if rows.iter().any(|row| {
+        columns.iter().zip(&widths).any(|(key, width)| {
+            UnicodeWidthStr::width(table_cell(key, &row[key]).as_str()) > *width
+        })
+    }) {
+        lines.extend(wrap(
+            "Values shortened to fit; use --output json for complete values.",
             terminal_width,
         ));
     }
@@ -327,24 +345,35 @@ fn fields(cli: &Cli) -> &[String] {
 /// Machine exports contain records only; collection metadata remains on stderr.
 pub fn emit(value: &Value, cli: &Cli) -> Result<()> {
     let terminal_output = std::io::stdout().is_terminal();
-    let text = match cli.output {
+    let inherited: Vec<String> = value["fields"]
+        .as_array()
+        .map(|fields| {
+            fields
+                .iter()
+                .filter_map(Value::as_str)
+                .map(str::to_owned)
+                .collect()
+        })
+        .unwrap_or_default();
+    let selected = if fields(cli).is_empty() {
+        &inherited
+    } else {
+        fields(cli)
+    };
+    let mut text = match cli.output {
         Format::Json | Format::Auto if cli.output.is_json() => {
             terminal_json(&value.to_string(), terminal_output)
         }
         Format::Csv => {
             let rows = rows(value);
-            let columns = columns(&rows, fields(cli));
+            let columns = columns(&rows, selected);
             let escape = |text: String| {
                 let text = if terminal_output {
                     terminal(&text)
                 } else {
                     text
                 };
-                if text.contains([',', '\n', '\r', '"']) {
-                    format!("\"{}\"", text.replace('"', "\"\""))
-                } else {
-                    text
-                }
+                quote_csv(text)
             };
             let mut lines = vec![
                 columns
@@ -406,10 +435,30 @@ pub fn emit(value: &Value, cli: &Cli) -> Result<()> {
             } else {
                 preferred
             };
-            table(value, fields(cli), preferred, width())
+            table(value, selected, preferred, width())
         }
         _ => render(value, false),
     };
+    if !cli.output.is_json()
+        && !matches!(cli.output, Format::Csv | Format::Jsonl)
+        && value["items"].as_array().is_some_and(Vec::is_empty)
+    {
+        let hint = match cli.command {
+            Command::Profile(_) => "Create a connection with splunk-cli init --profile work.",
+            Command::Indexes(_) => {
+                "Check your Splunk role and index permissions with an administrator."
+            }
+            Command::SavedSearches(_) => {
+                "Check --app and --owner, or list all visible owners with --owner -."
+            }
+            Command::Jobs(Jobs::List(_)) => {
+                "Create a job with splunk-cli jobs create 'index=main | head 10'."
+            }
+            _ => "Check the SPL, time range, permissions, and result offset.",
+        };
+        text.push('\n');
+        text.push_str(&wrap(hint, width()).join("\n"));
+    }
     if matches!(cli.output, Format::Csv | Format::Jsonl)
         && value["items"].is_array()
         && (!cli.quiet || value["has_more"] == true || value["truncated"] == true)

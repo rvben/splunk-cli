@@ -11,7 +11,10 @@ pub async fn signal() {
 
 pub async fn run<T>(operation: impl std::future::Future<Output = Result<T>>) -> Result<T> {
     tokio::select! {
+        // Register the OS handler before an operation can launch a browser or
+        // dispatch a request that makes cancellation observable to its caller.
+        biased;
+        _ = signal() => Err(Error::new("interrupted", "Operation interrupted")),
         result = operation => result,
-        _ = signal() => Err(Error::new("interrupted", "Operation interrupted; an existing Splunk job is still available")),
     }
 }
